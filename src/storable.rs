@@ -148,3 +148,21 @@ impl BoundedStorable for u8 {
         1
     }
 }
+
+#[cfg(feature = "candid")]
+impl Storable for candid::Principal {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        std::borrow::Cow::Owned(self.as_slice().to_vec())
+    }
+
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self::from_slice(&bytes)
+    }
+}
+
+#[cfg(feature = "candid")]
+impl BoundedStorable for candid::Principal {
+    fn max_size() -> u32 {
+        29
+    }
+}
