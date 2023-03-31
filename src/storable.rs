@@ -383,7 +383,7 @@ pub(crate) const fn bytes_to_store_size<A: BoundedStorable>() -> u32 {
 #[cfg(feature = "candid")]
 impl Storable for candid::Principal {
     fn to_bytes(&self) -> Cow<[u8]> {
-        Cow::Owned(self.as_slice().to_vec())
+        Cow::Borrowed(self.as_slice())
     }
 
     fn from_bytes(bytes: Cow<[u8]>) -> Self {
