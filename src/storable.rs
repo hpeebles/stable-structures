@@ -568,3 +568,19 @@ pub(crate) const fn bytes_to_store_size(bounds: &Bounds) -> u32 {
         4
     }
 }
+
+#[cfg(feature = "candid")]
+impl Storable for candid::Principal {
+    fn to_bytes(&self) -> Cow<[u8]> {
+        Cow::Borrowed(self.as_slice())
+    }
+
+    fn from_bytes(bytes: Cow<[u8]>) -> Self {
+        Self::from_slice(&bytes)
+    }
+
+    const BOUND: Bound = Bound::Bounded {
+        max_size: 29,
+        is_fixed_size: false,
+    };
+}

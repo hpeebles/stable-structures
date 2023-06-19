@@ -17,6 +17,7 @@ repository = "https://github.com/dfinity/stable-structures"
 bench = false
 
 [dependencies]
+candid = { workspace = true, optional = true }
 # An optional dependency to profile parts of the code.
 profiler = { path = "./profiler", optional = true }
 
