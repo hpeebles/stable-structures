@@ -11,10 +11,13 @@ keywords = ["internet-computer", "dfinity", "stable-structures"]
 include = ["src", "Cargo.toml", "LICENSE", "README.md"]
 repository = "https://github.com/dfinity/stable-structures"
 
+[dependencies]
+candid = { version = "0.9.1", optional = true }
+
 [dev-dependencies]
 criterion = "0.4.0"
-ic-cdk = "0.6.8"
-ic-cdk-macros = "0.6.8"
+ic-cdk = "0.10.0"
+ic-cdk-macros = "0.7.0"
 lazy_static = "1.4.0"
 maplit = "1.0.2"
 proptest = "1"
