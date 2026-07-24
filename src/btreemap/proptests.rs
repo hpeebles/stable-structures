@@ -24,6 +24,7 @@ enum Operation {
     Get(usize),
     Remove(usize),
     EntryInsertOrXor { key: Vec<u8>, value: Vec<u8> },
+    EntryRemove(usize),
     Range { from: usize, len: usize },
     PopLast,
     PopFirst,
@@ -48,6 +49,7 @@ fn operation_strategy() -> impl Strategy<Value = Operation> {
         15 => (any::<usize>()).prop_map(Operation::Remove),
         10 => (any::<Vec<u8>>(), any::<Vec<u8>>())
             .prop_map(|(key, value)| Operation::EntryInsertOrXor { key, value }),
+        10 => (any::<usize>()).prop_map(Operation::EntryRemove),
         5 => (any::<usize>(), any::<usize>())
             .prop_map(|(from, len)| Operation::Range { from, len }),
         2 =>  Just(Operation::PopFirst),
@@ -289,8 +291,10 @@ fn entry(
                     std_entry.and_modify(|v| *v = key).or_insert(key);
                 }
                 1 => {
-                    entry.and_modify(|v| *v += 1).or_insert(key);
-                    std_entry.and_modify(|v| *v += 1).or_insert(key);
+                    entry.and_modify(|v| *v = v.wrapping_add(1)).or_insert(key);
+                    std_entry
+                        .and_modify(|v| *v = v.wrapping_add(1))
+                        .or_insert(key);
                 }
                 2 => {
                     match entry {
@@ -474,6 +478,31 @@ fn execute_operation<M: Memory>(
                 .or_insert(value);
 
             assert_eq!(btree.get(&key).as_ref(), std_btree.get(&key));
+        }
+        Operation::EntryRemove(idx) => {
+            assert_eq!(std_btree.len(), btree.len() as usize);
+            if std_btree.is_empty() {
+                return;
+            }
+
+            let idx = idx % std_btree.len();
+
+            if let Some(k) = btree
+                .iter()
+                .skip(idx)
+                .take(1)
+                .next()
+                .map(|entry| entry.key().clone())
+            {
+                eprintln!("EntryRemove({})", hex::encode(&k));
+                let expected = std_btree.remove(&k).expect("key must exist in std map");
+                match btree.entry(k) {
+                    Entry::Occupied(e) => {
+                        assert_eq!(e.remove().into_value(), expected);
+                    }
+                    Entry::Vacant(_) => panic!("entry must be occupied"),
+                }
+            }
         }
 
         Operation::Range { from, len } => {

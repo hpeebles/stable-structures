@@ -739,12 +739,18 @@ where
             return entry::Entry::Vacant(entry::VacantEntry {
                 map: self,
                 key,
-                location: None,
+                slot: None,
             });
         }
 
-        // Load the root from memory.
-        let mut root = self.load_node(self.root_addr);
+        // Take the root from the node cache, or load it from memory. The node is handed
+        // to the returned entry, which reads and writes it without another load. It is
+        // not put back into the cache when the entry goes away: mutating an entry saves
+        // the node, and `save_node` invalidates the cache slot precisely because a
+        // just-saved node holds all of its keys and values materialized. An entry that
+        // is dropped without mutating therefore costs at most one cold cache slot,
+        // refilled by the next ordinary lookup.
+        let mut root = self.take_or_load_node(self.root_addr);
 
         // Check if the key already exists in the root.
         if let Ok(idx) = root.search(&key, self.memory()) {
@@ -752,34 +758,29 @@ where
             return entry::Entry::Occupied(entry::OccupiedEntry {
                 map: self,
                 key,
-                node: root,
-                idx,
+                slot: entry::NodeSlot::new(root, idx, 0),
             });
         }
 
         root = self.split_root_if_full(root);
 
-        let (key, node, search_result) =
-            self.find_node_for_insert(root, key, 0, |_, node, idx, key, key_exists| {
-                if key_exists {
-                    (key, node, Ok(idx))
-                } else {
-                    (key, node, Err(idx))
-                }
+        let (key, slot, key_exists) =
+            self.find_node_for_insert(root, key, 0, |_, node, idx, depth, key, key_exists| {
+                (key, entry::NodeSlot::new(node, idx, depth), key_exists)
             });
 
-        match search_result {
-            Ok(idx) => entry::Entry::Occupied(entry::OccupiedEntry {
+        if key_exists {
+            entry::Entry::Occupied(entry::OccupiedEntry {
                 map: self,
                 key,
-                node,
-                idx,
-            }),
-            Err(idx) => entry::Entry::Vacant(entry::VacantEntry {
+                slot,
+            })
+        } else {
+            entry::Entry::Vacant(entry::VacantEntry {
                 map: self,
                 key,
-                location: Some((node, idx)),
-            }),
+                slot: Some(slot),
+            })
         }
     }
 
@@ -817,11 +818,15 @@ where
     /// * `map`        — mutable access to the map (for saving nodes, updating length, etc.)
     /// * `node`       — the target node
     /// * `idx`        — the relevant slot index within `node`
+    /// * `depth`      — the depth of `node` (distance from the root)
     /// * `key`        — the key being inserted
     /// * `key_exists` — `true` if `key` is already present at `idx`; `false` if `idx` is
     ///                  the position where `key` should be inserted
     ///
     /// The callback's return value is propagated back to the caller.
+    ///
+    /// Unmodified nodes along the traversal path are returned to the node cache. The
+    /// target node is not: ownership passes to `callback`, which is responsible for it.
     ///
     /// PRECONDITION: `node` is not full.
     fn find_node_for_insert<R>(
@@ -829,7 +834,7 @@ where
         mut node: Node<K>,
         key: K,
         depth: u8,
-        callback: impl FnOnce(&mut Self, Node<K>, usize, K, bool) -> R,
+        callback: impl FnOnce(&mut Self, Node<K>, usize, u8, K, bool) -> R,
     ) -> R {
         // We're guaranteed by the caller that the provided node is not full.
         assert!(!node.is_full());
@@ -838,7 +843,7 @@ where
         match node.search(&key, self.memory()) {
             Ok(idx) => {
                 // Key found.
-                callback(self, node, idx, key, true)
+                callback(self, node, idx, depth, key, true)
             }
             Err(idx) => {
                 // The key isn't in the node. `idx` is where that key should be inserted.
@@ -846,7 +851,7 @@ where
                 match node.node_type() {
                     NodeType::Leaf => {
                         // The node is a non-full leaf.
-                        callback(self, node, idx, key, false)
+                        callback(self, node, idx, depth, key, false)
                     }
                     NodeType::Internal => {
                         // The node is an internal node.
@@ -859,7 +864,7 @@ where
                             if let Ok(idx) = child.search(&key, self.memory()) {
                                 // Key found. The parent node is unmodified — return it to cache.
                                 self.return_node(node, depth);
-                                return callback(self, child, idx, key, true);
+                                return callback(self, child, idx, child_depth, key, true);
                             }
 
                             // The child is full. Split the child.

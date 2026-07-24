@@ -32,6 +32,29 @@ use crate::{BTreeMap, Memory, Storable};
 use std::borrow::Cow;
 use std::marker::PhantomData;
 
+/// A loaded node together with the index of one slot inside it: for an
+/// [`OccupiedEntry`] the slot holding the entry, for a [`VacantEntry`] the slot the key
+/// would occupy. `depth` is the node's distance from the root, which the node cache's
+/// eviction policy needs.
+///
+/// The node itself is kept, rather than just its address, so that reading and writing
+/// through an entry needs no further node loads. [`BTreeMap::entry`] takes the node out
+/// of the map's node cache; it is put back only where that is both useful and cheap (see
+/// [`OccupiedEntry::remove`]). Mutating an entry saves the node, which invalidates its
+/// cache slot — a just-saved node holds every one of its keys and values materialized,
+/// so returning it to the cache in that state would waste heap.
+pub(crate) struct NodeSlot<K: Storable + Ord + Clone> {
+    pub(crate) node: Node<K>,
+    pub(crate) idx: usize,
+    pub(crate) depth: u8,
+}
+
+impl<K: Storable + Ord + Clone> NodeSlot<K> {
+    pub(crate) fn new(node: Node<K>, idx: usize, depth: u8) -> Self {
+        Self { node, idx, depth }
+    }
+}
+
 /// A view into a single entry of a [`BTreeMap`], which may either be occupied or vacant.
 ///
 /// This type is returned by [`BTreeMap::entry`].
@@ -54,7 +77,7 @@ pub struct VacantEntry<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: 
     /// node had not yet been allocated, so we defer the full insert to
     /// [`VacantEntry::insert`] to avoid corrupting the map if this entry is
     /// dropped without inserting.
-    pub(crate) location: Option<(Node<K>, usize)>,
+    pub(crate) slot: Option<NodeSlot<K>>,
 }
 
 /// A view into an occupied entry in a [`BTreeMap`].
@@ -63,8 +86,7 @@ pub struct VacantEntry<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: 
 pub struct OccupiedEntry<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> {
     pub(crate) map: &'a mut BTreeMap<K, V, M>,
     pub(crate) key: K,
-    pub(crate) node: Node<K>,
-    pub(crate) idx: usize,
+    pub(crate) slot: NodeSlot<K>,
 }
 
 /// A value returned by [`OccupiedEntry::insert`] or [`OccupiedEntry::remove`] that has not
@@ -168,7 +190,7 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> Entry<'a, 
         match self {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(entry) => {
-                let val = default(&entry.key);
+                let val = default(entry.key());
                 entry.insert(val)
             }
         }
@@ -236,35 +258,26 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> VacantEntr
     /// Inserts `value` into the map at this entry's key and returns an [`OccupiedEntry`]
     /// pointing at the newly inserted value.
     pub fn insert(self, value: V) -> OccupiedEntry<'a, K, V, M> {
-        match self.location {
-            Some((mut node, idx)) => {
-                node.insert_entry(idx, (self.key.clone(), value.into_bytes_checked()));
-                self.map.save_node(&mut node);
-                self.map.length += 1;
-                self.map.save_header();
-                OccupiedEntry {
-                    map: self.map,
-                    key: self.key,
-                    node,
-                    idx,
-                }
+        let Self { map, key, slot } = self;
+        let slot = match slot {
+            Some(mut slot) => {
+                slot.node
+                    .insert_entry(slot.idx, (key.clone(), value.into_bytes_checked()));
+                map.save_node(&mut slot.node);
+                map.length += 1;
+                map.save_header();
+                slot
             }
             None => {
                 // The map was empty when `entry()` was called. Delegate to the regular
-                // insert path which handles root allocation, then set the node and idx of the
-                // new `OccupiedEntry` to the root node and index 0.
-                let map = self.map;
-                let key = self.key;
+                // insert path, which handles allocating the root, then point the new
+                // `OccupiedEntry` at the root node's first slot.
                 map.insert(key.clone(), value);
-                let node = map.load_node(map.root_addr);
-                OccupiedEntry {
-                    map,
-                    key,
-                    node,
-                    idx: 0,
-                }
+                let node = map.take_or_load_node(map.root_addr);
+                NodeSlot::new(node, 0, 0)
             }
-        }
+        };
+        OccupiedEntry { map, key, slot }
     }
 }
 
@@ -281,8 +294,14 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
 
     /// Returns the current value associated with this entry.
     pub fn get(&self) -> V {
-        let value_bytes = self.node.value(self.idx, self.map.memory());
-        V::from_bytes(Cow::Borrowed(value_bytes))
+        // Read straight out of the node the entry already holds — no load required.
+        // The read is uncached so that repeated reads don't inflate the node with a
+        // materialized value buffer.
+        let value_bytes = self
+            .slot
+            .node
+            .read_value_uncached(self.slot.idx, self.map.memory());
+        V::from_bytes(Cow::Owned(value_bytes))
     }
 
     /// Provides in-place mutable access to the value in this occupied entry.
@@ -306,9 +325,21 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
     pub fn and_modify(mut self, f: impl FnOnce(&mut V)) -> Self {
         let mut value = self.get();
         f(&mut value);
-        self.map
-            .update_value(&mut self.node, self.idx, value.into_bytes_checked());
+        self.write_value(value);
         self
+    }
+
+    /// Overwrites the value in this entry's slot, returning the old bytes.
+    ///
+    /// `update_value` saves the node, which invalidates its cache slot. The node is
+    /// deliberately not put back into the cache: a just-saved node holds every one of
+    /// its keys and values materialized, so caching it in that state would waste heap.
+    fn write_value(&mut self, value: V) -> Vec<u8> {
+        self.map.update_value(
+            &mut self.slot.node,
+            self.slot.idx,
+            value.into_bytes_checked(),
+        )
     }
 
     /// Replaces the current value with `value` and returns the previous value as a
@@ -329,10 +360,7 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
     /// assert_eq!(map.get(&1), Some(99));
     /// ```
     pub fn insert(mut self, value: V) -> LazyValue<V> {
-        let old_bytes = self
-            .map
-            .update_value(&mut self.node, self.idx, value.into_bytes_checked());
-        LazyValue::new(old_bytes)
+        LazyValue::new(self.write_value(value))
     }
 
     /// Removes the entry from the map and returns the stored value as a [`LazyValue`], which
@@ -352,29 +380,32 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
     /// assert!(map.is_empty());
     /// ```
     pub fn remove(self) -> LazyValue<V> {
-        let bytes = match self.node.node_type() {
-            NodeType::Leaf if self.node.can_remove_entry_without_merging() => {
+        let Self { map, key, slot } = self;
+        let NodeSlot {
+            mut node,
+            idx,
+            depth,
+        } = slot;
+        let bytes = match node.node_type() {
+            NodeType::Leaf if node.can_remove_entry_without_merging() => {
                 // Fast path: the leaf has enough entries to remove without merging.
-                let mut node = self.node;
-                let value = node.remove_entry(self.idx, self.map.memory()).1;
-                self.map.length -= 1;
-                if node.entries_len() == 0 {
-                    // The leaf was the only node (the root). Deallocate it.
-                    self.map.deallocate_node(node);
-                    self.map.root_addr = crate::types::NULL;
-                } else {
-                    self.map.save_node(&mut node);
-                }
-                self.map.save_header();
+                let value = node.remove_entry(idx, map.memory()).1;
+                // `can_remove_entry_without_merging` guarantees the leaf held more than
+                // the minimum number of entries, so it cannot be empty after removal.
+                debug_assert!(node.entries_len() > 0);
+                map.save_node(&mut node);
+                map.length -= 1;
+                map.save_header();
                 value
             }
             _ => {
-                // Slow path: the node may need rebalancing/merging.
-                // Drop the already-loaded node and do a fresh traversal from the root.
-                let root = self.map.take_or_load_node(self.map.root_addr);
-                self.map
-                    .remove_helper(root, &self.key, 0)
-                    .expect("key must exist")
+                // Slow path: the removal may require rebalancing/merging, so do a fresh
+                // traversal from the root. The node is unmodified, so return it to the
+                // cache first — the traversal can then take it from there rather than
+                // re-reading it from memory.
+                map.return_node(node, depth);
+                let root = map.take_or_load_node(map.root_addr);
+                map.remove_helper(root, &key, 0).expect("key must exist")
             }
         };
         LazyValue::new(bytes)
@@ -392,6 +423,15 @@ impl<T: Storable> LazyValue<T> {
     /// Deserializes and returns the value.
     pub fn into_value(self) -> T {
         T::from_bytes(Cow::Owned(self.bytes))
+    }
+}
+
+impl<T: Storable> std::fmt::Debug for LazyValue<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The value is intentionally not deserialized here.
+        f.debug_struct("LazyValue")
+            .field("num_bytes", &self.bytes.len())
+            .finish()
     }
 }
 
@@ -524,6 +564,66 @@ mod tests {
         };
         assert_eq!(e.remove().into_value(), 42);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn entry_uses_the_node_cache_along_the_path() {
+        let mut map = new_map().with_node_cache(32);
+        for i in 0u32..1000 {
+            map.insert(i, i);
+        }
+
+        // Warm the cache along the path, then probe the same key again: the nodes on
+        // the way down are taken from the cache and put back by the traversal, so the
+        // second probe hits rather than re-reading them from memory.
+        let _ = map.entry(500);
+        map.node_cache_reset_metrics();
+        let _ = map.entry(500);
+        assert!(map.node_cache_metrics().hits() > 0);
+
+        // The same holds for a vacant entry dropped without inserting, and the map is
+        // unchanged by the probe.
+        let _ = map.entry(5000);
+        map.node_cache_reset_metrics();
+        let _ = map.entry(5000);
+        assert!(map.node_cache_metrics().hits() > 0);
+        assert_eq!(map.get(&5000), None);
+    }
+
+    #[test]
+    fn reading_and_writing_through_an_entry_needs_no_further_loads() {
+        let mut map = new_map().with_node_cache(32);
+        for i in 0u32..1000 {
+            map.insert(i, i);
+        }
+
+        let Entry::Occupied(e) = map.entry(500) else {
+            panic!();
+        };
+        // The entry holds its node, so reading and writing through it touch the cache
+        // not at all — no lookups, hence no loads from memory.
+        e.map.node_cache_reset_metrics();
+        assert_eq!(e.get(), 500);
+        let e = e.and_modify(|v| *v += 1);
+        assert_eq!(e.get(), 501);
+        assert_eq!(e.map.node_cache_metrics().total(), 0);
+
+        assert_eq!(map.get(&500), Some(501));
+    }
+
+    #[test]
+    fn entry_mutations_do_not_leave_stale_nodes_in_cache() {
+        let mut map = new_map().with_node_cache(32);
+        for i in 0u32..1000 {
+            map.insert(i, i);
+        }
+        for i in 0u32..1000 {
+            // Warm the cache along the key's path, mutate through the entry API,
+            // then read back through the cached path.
+            assert_eq!(map.get(&i), Some(i));
+            map.entry(i).and_modify(|v| *v += 1);
+            assert_eq!(map.get(&i), Some(i + 1));
+        }
     }
 
     #[test]
