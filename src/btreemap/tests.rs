@@ -3207,6 +3207,39 @@ fn insert_many_with_unbounded_values() {
 }
 
 #[test]
+fn insert_many_across_layouts() {
+    // The V1 node layout differs from V2 in how keys and values are sized and written, and
+    // `run_btree_test` covers V1, V1-migrated-to-V2 and V2. Bounded types are required
+    // here: `run_btree_test` silently skips the V1 arms for unbounded ones.
+    let n = 500u64;
+    let batches: Vec<(&str, Vec<(u64, u64)>)> = vec![
+        ("ascending", (0..n).map(|i| (i, i * 3)).collect()),
+        ("descending", (0..n).rev().map(|i| (i, i * 3)).collect()),
+        ("sawtooth", (0..n).map(|i| ((i * 7) % n, i)).collect()),
+        ("duplicates", vec![(1, 10), (2, 20), (1, 11), (2, 21)]),
+    ];
+
+    for (label, batch) in batches {
+        run_btree_test::<u64, u64, _, _>(|mut actual| {
+            let mut expected = std::collections::BTreeMap::new();
+            for (key, value) in batch.clone() {
+                expected.insert(key, value);
+            }
+            actual.insert_many(batch.clone());
+
+            assert_eq!(actual.len() as usize, expected.len(), "{label}");
+            let actual_entries: Vec<(u64, u64)> =
+                actual.iter().map(|e| (*e.key(), e.value())).collect();
+            let expected_entries: Vec<(u64, u64)> = expected.into_iter().collect();
+            assert_eq!(actual_entries, expected_entries, "{label}");
+            for (key, value) in &expected_entries {
+                assert_eq!(actual.get(key), Some(*value), "{label} key {key}");
+            }
+        });
+    }
+}
+
+#[test]
 fn insert_many_handles_out_of_order_input() {
     // `insert_many` is tuned for ascending keys, but wrong ordering must never corrupt the
     // tree — it may only cost extra descents. These orderings are chosen to make the path

@@ -587,20 +587,6 @@ benches:
       heap_increase: 161
       stable_memory_increase: 3613
     scopes: {}
-  btreemap_v2_insert_batch_into_existing_u64_u64:
-    total:
-      calls: 1
-      instructions: 294066274
-      heap_increase: 0
-      stable_memory_increase: 0
-    scopes: {}
-  btreemap_v2_insert_batch_random_u64_u64:
-    total:
-      calls: 1
-      instructions: 356430975
-      heap_increase: 0
-      stable_memory_increase: 6
-    scopes: {}
   btreemap_v2_insert_blob8_u64:
     total:
       calls: 1
@@ -734,45 +720,73 @@ benches:
       heap_increase: 0
       stable_memory_increase: 20
     scopes: {}
-  btreemap_v2_insert_desc_u64_u64:
+  btreemap_v2_insert_loop_desc_u64_u64:
     total:
       calls: 1
       instructions: 386646941
       heap_increase: 0
       stable_memory_increase: 8
     scopes: {}
+  btreemap_v2_insert_loop_into_existing_u64_u64:
+    total:
+      calls: 1
+      instructions: 294066274
+      heap_increase: 0
+      stable_memory_increase: 0
+    scopes: {}
+  btreemap_v2_insert_loop_overwrite_1kib_values:
+    total:
+      calls: 1
+      instructions: 74252131
+      heap_increase: 1
+      stable_memory_increase: 0
+    scopes: {}
+  btreemap_v2_insert_loop_random_u64_u64:
+    total:
+      calls: 1
+      instructions: 356430975
+      heap_increase: 0
+      stable_memory_increase: 6
+    scopes: {}
   btreemap_v2_insert_many_desc_u64_u64:
     total:
       calls: 1
-      instructions: 96826813
+      instructions: 96975057
       heap_increase: 0
       stable_memory_increase: 8
     scopes: {}
   btreemap_v2_insert_many_into_existing_u64_u64:
     total:
       calls: 1
-      instructions: 49506647
+      instructions: 49676638
+      heap_increase: 0
+      stable_memory_increase: 0
+    scopes: {}
+  btreemap_v2_insert_many_overwrite_1kib_values:
+    total:
+      calls: 1
+      instructions: 10107326
       heap_increase: 0
       stable_memory_increase: 0
     scopes: {}
   btreemap_v2_insert_many_seq_u64_u64:
     total:
       calls: 1
-      instructions: 77307535
+      instructions: 77454317
       heap_increase: 0
       stable_memory_increase: 8
     scopes: {}
   btreemap_v2_insert_many_sorted_random_u64_u64:
     total:
       calls: 1
-      instructions: 86845730
+      instructions: 86992512
       heap_increase: 3
       stable_memory_increase: 8
     scopes: {}
   btreemap_v2_insert_many_unsorted_u64_u64:
     total:
       calls: 1
-      instructions: 343377265
+      instructions: 343413445
       heap_increase: 0
       stable_memory_increase: 6
     scopes: {}

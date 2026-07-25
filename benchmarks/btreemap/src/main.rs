@@ -441,8 +441,10 @@ pub fn btreemap_v2_get_10mib_values() -> BenchResult {
     })
 }
 
-// Batch insertion. Each `insert_many` benchmark pairs with the plain-loop benchmark
-// directly above it, over exactly the same keys, so the two are directly comparable.
+// Batch insertion. Every `insert_many` benchmark has an `insert_loop` counterpart over
+// exactly the same keys and values, so the two are directly comparable. The pairs are kept
+// adjacent below; the one exception is `insert_many_seq`, whose counterpart is the
+// pre-existing `btreemap_v2_insert_seq_u64_u64`.
 
 #[bench(raw)]
 pub fn btreemap_v2_insert_many_seq_u64_u64() -> BenchResult {
@@ -457,22 +459,10 @@ pub fn btreemap_v2_insert_many_seq_u64_u64() -> BenchResult {
     })
 }
 
-#[bench(raw)]
-pub fn btreemap_v2_insert_batch_random_u64_u64() -> BenchResult {
-    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
-    let mut rng = Rng::from_seed(0);
-    let items = generate_random_kv::<u64, u64>(10_000, &mut rng);
-    bench_fn(|| {
-        for (key, value) in items {
-            btree.insert(key, value);
-        }
-    })
-}
-
 // Descending keys. The held path should unwind leftwards just as it unwinds rightwards for
 // ascending keys, so this ought to coalesce about as well.
 #[bench(raw)]
-pub fn btreemap_v2_insert_desc_u64_u64() -> BenchResult {
+pub fn btreemap_v2_insert_loop_desc_u64_u64() -> BenchResult {
     let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
     let count = 10_000u64;
     let mut rng = Rng::from_seed(0);
@@ -492,6 +482,19 @@ pub fn btreemap_v2_insert_many_desc_u64_u64() -> BenchResult {
     let items: Vec<(u64, u64)> = (0..count).rev().map(|i| (i, rng.rand_u64())).collect();
     bench_fn(|| {
         btree.insert_many(items);
+    })
+}
+
+// The baseline for both unordered variants below.
+#[bench(raw)]
+pub fn btreemap_v2_insert_loop_random_u64_u64() -> BenchResult {
+    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
+    let mut rng = Rng::from_seed(0);
+    let items = generate_random_kv::<u64, u64>(10_000, &mut rng);
+    bench_fn(|| {
+        for (key, value) in items {
+            btree.insert(key, value);
+        }
     })
 }
 
@@ -524,7 +527,7 @@ pub fn btreemap_v2_insert_many_unsorted_u64_u64() -> BenchResult {
 // Inserting a sorted run into a map that already holds 100k entries: the batch lands in
 // leaves that mostly have room, which is where coalescing pays most.
 #[bench(raw)]
-pub fn btreemap_v2_insert_batch_into_existing_u64_u64() -> BenchResult {
+pub fn btreemap_v2_insert_loop_into_existing_u64_u64() -> BenchResult {
     let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
     for i in 0..100_000u64 {
         btree.insert(i * 10, i);
@@ -546,6 +549,50 @@ pub fn btreemap_v2_insert_many_into_existing_u64_u64() -> BenchResult {
     let items: Vec<(u64, u64)> = (0..10_000u64).map(|i| (i * 10 + 5, i)).collect();
     bench_fn(|| {
         btree.insert_many(items);
+    })
+}
+
+// Pure overwrite of existing keys, with values large enough to live on V2 overflow pages.
+// `insert` has to read the displaced value back in order to return it; `insert_many`
+// discards it and so skips that read entirely.
+#[bench(raw)]
+pub fn btreemap_v2_insert_loop_overwrite_1kib_values() -> BenchResult {
+    let count = 2_000usize;
+    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
+    let mut rng = Rng::from_seed(0);
+    for (i, value) in generate_random_blocks(count, 1024, &mut rng)
+        .into_iter()
+        .enumerate()
+    {
+        btree.insert(i as u64, value);
+    }
+    let new_values = generate_random_blocks(count, 1024, &mut rng);
+    bench_fn(|| {
+        for (i, value) in new_values.into_iter().enumerate() {
+            btree.insert(i as u64, value);
+        }
+    })
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_insert_many_overwrite_1kib_values() -> BenchResult {
+    let count = 2_000usize;
+    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
+    let mut rng = Rng::from_seed(0);
+    for (i, value) in generate_random_blocks(count, 1024, &mut rng)
+        .into_iter()
+        .enumerate()
+    {
+        btree.insert(i as u64, value);
+    }
+    let new_values = generate_random_blocks(count, 1024, &mut rng);
+    bench_fn(|| {
+        btree.insert_many(
+            new_values
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (i as u64, v)),
+        );
     })
 }
 

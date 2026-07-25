@@ -127,7 +127,7 @@ where
                 Ok(idx) => {
                     // The key lives in this internal node; overwrite it where it sits.
                     let bottom = self.path.last_mut().expect("checked above");
-                    bottom.node.swap_value(idx, value, self.map.memory());
+                    bottom.node.set_value(idx, value);
                     bottom.dirty = true;
                     return;
                 }
@@ -202,7 +202,7 @@ where
 
         if let Ok(idx) = search {
             let leaf = self.path.last_mut().expect("checked above");
-            leaf.node.swap_value(idx, value, self.map.memory());
+            leaf.node.set_value(idx, value);
             leaf.dirty = true;
             return;
         }
@@ -219,6 +219,9 @@ where
             // ordinary insert path grow the tree, then start a new path for the next key.
             self.release_path();
             self.map.insert_serialized(key, value);
+            // `insert_serialized` saves the header itself on every path that moves `length`
+            // or `root_addr`, so this only guards against that ceasing to be true. It costs
+            // at most one extra header write for the whole batch.
             self.header_dirty = true;
             return;
         }

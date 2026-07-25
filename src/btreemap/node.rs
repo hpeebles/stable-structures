@@ -113,6 +113,13 @@ impl<K: Storable + Ord + Clone> Node<K> {
         self.entries.len() >= CAPACITY
     }
 
+    /// Replaces the value at `idx`, discarding the old one without reading it.
+    ///
+    /// Prefer this to [`Node::swap_value`] when the previous value is not needed.
+    pub fn set_value(&mut self, idx: usize, new: Vec<u8>) {
+        self.entries[idx].1 = LazyValue::by_value(new);
+    }
+
     /// Replaces the value at `idx` and returns the old one.
     pub fn swap_value<M: Memory>(&mut self, idx: usize, new: Vec<u8>, memory: &M) -> Vec<u8> {
         let old = core::mem::replace(&mut self.entries[idx].1, LazyValue::by_value(new));
