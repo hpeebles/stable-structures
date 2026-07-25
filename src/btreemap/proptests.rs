@@ -263,10 +263,13 @@ fn no_memory_leaks(#[strategy(pvec(pvec(0..u8::MAX, 100..10_000), 100))] keys: V
     assert_eq!(btree.allocator.num_allocated_chunks(), 0);
 }
 
+// A node holds up to `CAPACITY` (11) entries, so the operation count has to comfortably
+// exceed that for the tree to actually split and merge. This is also the only entry-API
+// coverage of the V1 and V1-migrated-to-V2 layouts, via `run_btree_test`.
 #[proptest]
 fn entry(
-    #[strategy(pvec(0..255u8, 10))] keys: Vec<u8>,
-    #[strategy(pvec(0..3u8, 10))] operations: Vec<u8>,
+    #[strategy(pvec(0..255u8, 200))] keys: Vec<u8>,
+    #[strategy(pvec(0..3u8, 200))] operations: Vec<u8>,
 ) {
     run_btree_test(|mut btree| {
         let mut std_map = StdBTreeMap::new();

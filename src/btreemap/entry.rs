@@ -282,14 +282,21 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> VacantEntr
 }
 
 impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEntry<'a, K, V, M> {
-    /// Returns a reference to the entry's key.
+    /// Returns a reference to the key stored in the map.
+    ///
+    /// As in the standard library, this is the key already held by the map, not the one
+    /// passed to [`BTreeMap::entry`]. The two compare equal, but they can differ in ways
+    /// `Ord` does not see — for example a `K` whose ordering ignores some of its fields.
     pub fn key(&self) -> &K {
-        &self.key
+        self.slot.node.key(self.slot.idx, self.map.memory())
     }
 
-    /// Consumes the entry and returns its key.
+    /// Consumes the entry and returns the key stored in the map.
+    ///
+    /// Like [`key`](Self::key), this is the map's own key rather than the one passed to
+    /// [`BTreeMap::entry`].
     pub fn into_key(self) -> K {
-        self.key
+        self.key().clone()
     }
 
     /// Returns the current value associated with this entry.
@@ -443,6 +450,77 @@ mod tests {
 
     fn new_map() -> BTreeMap<u32, u32, Rc<RefCell<Vec<u8>>>> {
         BTreeMap::new(Rc::new(RefCell::new(Vec::new())))
+    }
+
+    /// A key whose ordering ignores `tag`, so two keys can be `Ord`-equal while holding
+    /// different bytes. Used to tell the stored key apart from the one passed to `entry`.
+    #[derive(Clone, Debug)]
+    struct TaggedKey {
+        id: u32,
+        tag: u8,
+    }
+
+    impl PartialEq for TaggedKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+    impl Eq for TaggedKey {}
+    impl PartialOrd for TaggedKey {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for TaggedKey {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.id.cmp(&other.id)
+        }
+    }
+    impl Storable for TaggedKey {
+        fn to_bytes(&self) -> Cow<'_, [u8]> {
+            let mut bytes = self.id.to_be_bytes().to_vec();
+            bytes.push(self.tag);
+            Cow::Owned(bytes)
+        }
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_bytes().into_owned()
+        }
+        fn from_bytes(bytes: Cow<'_, [u8]>) -> Self {
+            Self {
+                id: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+                tag: bytes[4],
+            }
+        }
+        const BOUND: crate::storable::Bound = crate::storable::Bound::Bounded {
+            max_size: 5,
+            is_fixed_size: true,
+        };
+    }
+
+    /// `OccupiedEntry::key` must report the key held by the map, like the std lib does,
+    /// not the `Ord`-equal one that was passed to `entry`.
+    #[test]
+    fn occupied_entry_reports_the_stored_key() {
+        let mut map: BTreeMap<TaggedKey, u32, _> = BTreeMap::new(Rc::new(RefCell::new(Vec::new())));
+        map.insert(TaggedKey { id: 1, tag: 7 }, 100);
+
+        let Entry::Occupied(e) = map.entry(TaggedKey { id: 1, tag: 99 }) else {
+            panic!("key 1 is present");
+        };
+        assert_eq!(e.key().tag, 7, "`key` must return the stored key");
+        assert_eq!(e.into_key().tag, 7, "`into_key` must return the stored key");
+
+        // Overwriting the value must leave the stored key alone, also matching the std lib.
+        if let Entry::Occupied(e) = map.entry(TaggedKey { id: 1, tag: 42 }) {
+            e.insert(101);
+        }
+        assert_eq!(map.iter().next().unwrap().key().tag, 7);
+
+        // A vacant entry has no stored key, so it reports the one it was given.
+        let Entry::Vacant(e) = map.entry(TaggedKey { id: 2, tag: 55 }) else {
+            panic!("key 2 is absent");
+        };
+        assert_eq!(e.key().tag, 55);
     }
 
     #[test]
