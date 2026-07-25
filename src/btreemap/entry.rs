@@ -11,6 +11,19 @@
 //! not possible. Instead, `or_insert` (and its variants) return an [`OccupiedEntry`], which
 //! lets you continue reading or modifying the entry without a second key lookup.
 //!
+//! For the same reason there is no equivalent of the standard library's `get_mut` or
+//! `into_mut`. Use [`OccupiedEntry::and_modify`], which reads the value, hands it to your
+//! closure, and writes it back.
+//!
+//! # `entry` writes to stable memory
+//!
+//! [`BTreeMap::entry`] splits full nodes on the way down so that a later insert can finish
+//! in one pass. It therefore writes — allocating nodes and rewriting the header — even for
+//! a key that turns out to be present, and even if the entry is dropped unused. The cost is
+//! bounded (each node splits at most once, and that split was coming on the next insert
+//! anyway), but prefer [`BTreeMap::get`] when you only mean to read. See
+//! [`BTreeMap::entry`] for details.
+//!
 //! # Examples
 //!
 //! ```rust
@@ -257,6 +270,13 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> VacantEntr
 
     /// Inserts `value` into the map at this entry's key and returns an [`OccupiedEntry`]
     /// pointing at the newly inserted value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the serialized key or value exceeds the maximum size of its type, exactly
+    /// as [`BTreeMap::insert`] does. Note that [`BTreeMap::entry`] may already have split
+    /// nodes by this point; the map is left valid and consistent, but not necessarily in
+    /// the shape it had before `entry` was called.
     pub fn insert(self, value: V) -> OccupiedEntry<'a, K, V, M> {
         let Self { map, key, slot } = self;
         let slot = match slot {
@@ -300,6 +320,9 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
     }
 
     /// Returns the current value associated with this entry.
+    ///
+    /// Every call re-reads the value from stable memory and deserializes it; the result is
+    /// not memoized. Bind it to a local if you need it more than once.
     pub fn get(&self) -> V {
         // Read straight out of the node the entry already holds — no load required.
         // The read is uncached so that repeated reads don't inflate the node with a
@@ -315,6 +338,9 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
     ///
     /// Reads the current value, calls `f` with a mutable reference to it, then writes the
     /// modified value back. Returns `self` so the call can be chained.
+    ///
+    /// The write is unconditional: the value is re-serialized and the node saved even if
+    /// `f` left it untouched.
     ///
     /// # Examples
     ///
@@ -351,6 +377,11 @@ impl<'a, K: 'a + Storable + Ord + Clone, V: 'a + Storable, M: Memory> OccupiedEn
 
     /// Replaces the current value with `value` and returns the previous value as a
     /// [`LazyValue`], which is only deserialized if you call [`LazyValue::into_value`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the serialized `value` exceeds the maximum size of `V`, exactly as
+    /// [`BTreeMap::insert`] does. The map is left unmodified in that case.
     ///
     /// # Examples
     ///
@@ -430,6 +461,41 @@ impl<T: Storable> LazyValue<T> {
     /// Deserializes and returns the value.
     pub fn into_value(self) -> T {
         T::from_bytes(Cow::Owned(self.bytes))
+    }
+}
+
+// The `Debug` impls below print keys only. Values are deliberately left out: reading one
+// means a stable-memory read and a deserialization, which is not what anyone expects a
+// `Debug` impl to do.
+
+impl<K: Storable + Ord + Clone + std::fmt::Debug, V: Storable, M: Memory> std::fmt::Debug
+    for Entry<'_, K, V, M>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Entry::Vacant(entry) => f.debug_tuple("Entry::Vacant").field(entry).finish(),
+            Entry::Occupied(entry) => f.debug_tuple("Entry::Occupied").field(entry).finish(),
+        }
+    }
+}
+
+impl<K: Storable + Ord + Clone + std::fmt::Debug, V: Storable, M: Memory> std::fmt::Debug
+    for VacantEntry<'_, K, V, M>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VacantEntry")
+            .field("key", self.key())
+            .finish()
+    }
+}
+
+impl<K: Storable + Ord + Clone + std::fmt::Debug, V: Storable, M: Memory> std::fmt::Debug
+    for OccupiedEntry<'_, K, V, M>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OccupiedEntry")
+            .field("key", self.key())
+            .finish()
     }
 }
 

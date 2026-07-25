@@ -704,6 +704,19 @@ where
     /// Instead, `or_insert` (and its variants) return an [`OccupiedEntry`](entry::OccupiedEntry),
     /// which lets you continue operating on the entry without a second key lookup.
     ///
+    /// # This method writes to stable memory
+    ///
+    /// Unlike [`get`](Self::get) and [`contains_key`](Self::contains_key), `entry` **writes**.
+    /// So that a later insert can complete in a single pass, it splits every full node on the
+    /// path down from the root, which allocates nodes and rewrites the header — even when
+    /// `key` turns out to be present, and even if the returned entry is dropped without
+    /// inserting anything.
+    ///
+    /// The cost is bounded and self-limiting: each node splits at most once, and that split
+    /// would have happened on the next insert through the same path regardless. Repeating the
+    /// same probes allocates nothing further. Still, prefer [`get`](Self::get) or
+    /// [`contains_key`](Self::contains_key) when you only mean to read.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -729,6 +742,8 @@ where
     /// - [`entry::Entry`] — the type returned by this method
     /// - [`entry::OccupiedEntry`] — methods available when the key is present
     /// - [`entry::VacantEntry`] — methods available when the key is absent
+    #[must_use = "`entry` writes to stable memory even when its result is unused; \
+                  for a read-only lookup use `get` or `contains_key`"]
     pub fn entry(&mut self, key: K) -> entry::Entry<K, V, M> {
         // For an empty map the key is trivially absent.  Avoid calling
         // `find_node_for_insert` here because that eagerly allocates a root
@@ -747,9 +762,10 @@ where
         // to the returned entry, which reads and writes it without another load. It is
         // not put back into the cache when the entry goes away: mutating an entry saves
         // the node, and `save_node` invalidates the cache slot precisely because a
-        // just-saved node holds all of its keys and values materialized. An entry that
-        // is dropped without mutating therefore costs at most one cold cache slot,
-        // refilled by the next ordinary lookup.
+        // just-saved node holds all of its keys and values materialized. In *node cache*
+        // terms an entry dropped without mutating therefore costs at most one cold slot,
+        // refilled by the next ordinary lookup. That is not the whole cost of a dropped
+        // entry though — see the "This method writes to stable memory" section above.
         let mut root = self.take_or_load_node(self.root_addr);
 
         // Check if the key already exists in the root.
@@ -828,6 +844,11 @@ where
     /// Unmodified nodes along the traversal path are returned to the node cache. The
     /// target node is not: ownership passes to `callback`, which is responsible for it.
     ///
+    /// NOTE: this is the same descent as [`BTreeMap::insert_nonfull`], which stops at the
+    /// target node instead of inserting into it. The two were deliberately left separate:
+    /// expressing `insert` in terms of this callback form benchmarked slower. Keep the
+    /// split and descent logic in the two in sync.
+    ///
     /// PRECONDITION: `node` is not full.
     fn find_node_for_insert<R>(
         &mut self,
@@ -873,7 +894,16 @@ where
 
                             // The children have now changed. Search again for
                             // the child where we need to store the entry in.
-                            let idx = node.search(&key, self.memory()).unwrap_or_else(|idx| idx);
+                            // The median promoted by the split came out of `child`, which
+                            // was just shown not to contain `key`, so the search cannot
+                            // find it here; `Ok` would mean descending past a matching key
+                            // and inserting a duplicate.
+                            let search_result = node.search(&key, self.memory());
+                            debug_assert!(
+                                search_result.is_err(),
+                                "promoted median cannot equal the key"
+                            );
+                            let idx = search_result.unwrap_or_else(|idx| idx);
                             child = self.load_node(node.child(idx));
                         } else {
                             // Happy path: child is not full. The current node
@@ -892,6 +922,9 @@ where
     }
 
     /// Inserts an entry into a node that is *not full*.
+    ///
+    /// NOTE: shares its descent and node-splitting logic with
+    /// [`BTreeMap::find_node_for_insert`]; keep the two in sync.
     fn insert_nonfull(
         &mut self,
         mut node: Node<K>,
