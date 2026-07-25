@@ -287,7 +287,7 @@ struct BTreeHeader {
 
 /// One level of the root-to-leaf path that [`BTreeMap::insert_many`] holds open across a
 /// run of inserts.
-struct Frame<K: Storable + Ord + Clone> {
+struct PathLevel<K: Storable + Ord + Clone> {
     node: Node<K>,
 
     /// Index of this node among its parent's children. Meaningless for the root.
@@ -299,7 +299,7 @@ struct Frame<K: Storable + Ord + Clone> {
     /// always the case for the root.
     ///
     /// Both ends are tracked, not just the upper one, so that a key arriving out of order
-    /// is detected rather than being dropped into the wrong node. See [`Frame::covers`].
+    /// is detected rather than being dropped into the wrong node. See [`PathLevel::covers`].
     lower: Option<K>,
     upper: Option<K>,
 
@@ -311,7 +311,7 @@ struct Frame<K: Storable + Ord + Clone> {
     dirty: bool,
 }
 
-impl<K: Storable + Ord + Clone> Frame<K> {
+impl<K: Storable + Ord + Clone> PathLevel<K> {
     /// Whether `key` belongs somewhere under this node.
     ///
     /// For an ascending batch only the upper bound can ever fail, and that is the case this
@@ -340,7 +340,7 @@ where
     map: &'a mut BTreeMap<K, V, M>,
 
     /// Root first, leaf last. Empty before the first insert and after a fallback.
-    path: Vec<Frame<K>>,
+    path: Vec<PathLevel<K>>,
 
     /// Whether `length` or `root_addr` changed and the header still needs writing.
     header_dirty: bool,
@@ -362,19 +362,19 @@ where
 
     /// Releases a node that has left the path: written out if modified, handed back to the
     /// node cache otherwise.
-    fn release(&mut self, frame: Frame<K>) {
-        let mut node = frame.node;
-        if frame.dirty {
+    fn release(&mut self, level: PathLevel<K>) {
+        let mut node = level.node;
+        if level.dirty {
             self.map.save_node(&mut node);
         } else {
-            self.map.return_node(node, frame.depth);
+            self.map.return_node(node, level.depth);
         }
     }
 
     /// Releases the whole path, leaving it empty.
     fn release_path(&mut self) {
-        while let Some(frame) = self.path.pop() {
-            self.release(frame);
+        while let Some(level) = self.path.pop() {
+            self.release(level);
         }
     }
 
@@ -385,9 +385,9 @@ where
 
         // Drop back up the path until we reach a node that still covers this key. Since the
         // batch ascends, a node stops covering once the keys pass its upper bound.
-        while self.path.last().is_some_and(|frame| !frame.covers(&key)) {
-            let frame = self.path.pop().expect("just checked that one exists");
-            self.release(frame);
+        while self.path.last().is_some_and(|level| !level.covers(&key)) {
+            let level = self.path.pop().expect("just checked that one exists");
+            self.release(level);
         }
 
         if self.path.is_empty() {
@@ -425,7 +425,7 @@ where
         } else {
             self.map.take_or_load_node(self.map.root_addr)
         };
-        self.path.push(Frame {
+        self.path.push(PathLevel {
             node,
             index_in_parent: 0,
             lower: None,
@@ -459,7 +459,7 @@ where
             )
         };
         let node = self.map.take_or_load_node(address);
-        self.path.push(Frame {
+        self.path.push(PathLevel {
             node,
             index_in_parent: idx,
             lower,
@@ -519,19 +519,22 @@ where
     /// leaf is the root, or the parent has no room for the median — leaving the caller to
     /// fall back to [`BTreeMap::insert_serialized`], which grows the tree.
     fn split_leaf(&mut self, key: &K) -> bool {
-        let levels = self.path.len();
-        if levels < 2 || self.path[levels - 2].node.is_full() {
+        let depth_of_path = self.path.len();
+        if depth_of_path < 2 || self.path[depth_of_path - 2].node.is_full() {
             return false;
         }
 
-        let Frame {
+        let PathLevel {
             node: mut left,
             index_in_parent,
             lower,
             upper,
             depth,
             ..
-        } = self.path.pop().expect("checked that there are >= 2 levels");
+        } = self
+            .path
+            .pop()
+            .expect("checked that the path has a parent level");
 
         let mut right = self.map.allocate_node(NodeType::Leaf);
         let (median_key, median_value) = left.split(&mut right, self.map.memory());
@@ -539,7 +542,7 @@ where
         let parent = self
             .path
             .last_mut()
-            .expect("checked that there are >= 2 levels");
+            .expect("checked that the path has a parent level");
         parent
             .node
             .insert_child(index_in_parent + 1, right.address());
@@ -557,7 +560,7 @@ where
             (right, left, index_in_parent + 1, Some(median_key), upper)
         };
         self.map.save_node(&mut done);
-        self.path.push(Frame {
+        self.path.push(PathLevel {
             node: keep,
             index_in_parent: keep_index,
             lower: keep_lower,
