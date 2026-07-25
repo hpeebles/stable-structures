@@ -103,9 +103,6 @@ where
     }
 
     pub(super) fn insert(&mut self, key: K, value: V) {
-        // Serialize first, before any node is touched.
-        let value = value.into_bytes_checked();
-
         // Drop back up the path until we reach a node that still covers this key. Since the
         // batch ascends, a node stops covering once the keys pass its upper bound.
         while self.path.last().is_some_and(|level| !level.covers(&key)) {
@@ -127,7 +124,7 @@ where
                 Ok(idx) => {
                     // The key lives in this internal node; overwrite it where it sits.
                     let bottom = self.path.last_mut().expect("checked above");
-                    bottom.node.set_value(idx, value);
+                    bottom.node.set_value(idx, value.into_bytes_checked());
                     bottom.dirty = true;
                     return;
                 }
@@ -194,7 +191,7 @@ where
 
     /// Places `key` in the leaf at the bottom of the path, splitting it first if it is
     /// full.
-    fn insert_into_leaf(&mut self, key: K, value: Vec<u8>) {
+    fn insert_into_leaf(&mut self, key: K, value: V) {
         let search = {
             let leaf = self.path.last().expect("bottom is a leaf here");
             leaf.node.search(&key, self.map.memory())
@@ -202,7 +199,7 @@ where
 
         if let Ok(idx) = search {
             let leaf = self.path.last_mut().expect("checked above");
-            leaf.node.set_value(idx, value);
+            leaf.node.set_value(idx, value.into_bytes_checked());
             leaf.dirty = true;
             return;
         }
@@ -217,11 +214,12 @@ where
         {
             // The split could not be done in place. Write everything back and let the
             // ordinary insert path grow the tree, then start a new path for the next key.
+            // The key is absent, so nothing is deserialized to build the discarded return.
             self.release_path();
-            self.map.insert_serialized(key, value);
-            // `insert_serialized` saves the header itself on every path that moves `length`
-            // or `root_addr`, so this only guards against that ceasing to be true. It costs
-            // at most one extra header write for the whole batch.
+            self.map.insert(key, value);
+            // `insert` saves the header itself on every path that moves `length` or
+            // `root_addr`, so this only guards against that ceasing to be true. It costs at
+            // most one extra header write for the whole batch.
             self.header_dirty = true;
             return;
         }
@@ -232,7 +230,8 @@ where
             .node
             .search(&key, self.map.memory())
             .expect_err("the key was absent and a split cannot introduce it");
-        leaf.node.insert_entry(idx, (key, value));
+        leaf.node
+            .insert_entry(idx, (key, value.into_bytes_checked()));
         leaf.dirty = true;
         self.map.length += 1;
         self.header_dirty = true;
@@ -243,7 +242,7 @@ where
     ///
     /// Returns `false` without touching anything when the split cannot be done here — the
     /// leaf is the root, or the parent has no room for the median — leaving the caller to
-    /// fall back to [`BTreeMap::insert_serialized`], which grows the tree.
+    /// fall back to [`BTreeMap::insert`], which grows the tree.
     fn split_leaf(&mut self, key: &K) -> bool {
         let depth_of_path = self.path.len();
         if depth_of_path < 2 || self.path[depth_of_path - 2].node.is_full() {

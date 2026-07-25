@@ -658,14 +658,8 @@ where
     ///   key.to_bytes().len() <= max_size(Key)
     ///   value.to_bytes().len() <= max_size(Value)
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.insert_serialized(key, value.into_bytes_checked())
-            .map(Cow::Owned)
-            .map(V::from_bytes)
-    }
+        let value = value.into_bytes_checked();
 
-    /// The body of [`BTreeMap::insert`], taking an already-serialized value so that
-    /// callers holding raw bytes (such as [`BTreeMap::insert_many`]) can reuse it.
-    fn insert_serialized(&mut self, key: K, value: Vec<u8>) -> Option<Vec<u8>> {
         let root = if self.root_addr == NULL {
             // No root present. Allocate one.
             let node = self.allocate_node(NodeType::Leaf);
@@ -679,7 +673,9 @@ where
             // Check if the key already exists in the root.
             if let Ok(idx) = root.search(&key, self.memory()) {
                 // Key found, replace its value and return the old one.
-                return Some(self.update_value(&mut root, idx, value));
+                return Some(V::from_bytes(Cow::Owned(
+                    self.update_value(&mut root, idx, value),
+                )));
             }
 
             // If the root is full, we need to introduce a new node as the root.
@@ -708,6 +704,8 @@ where
         };
 
         self.insert_nonfull(root, key, value, 0)
+            .map(Cow::Owned)
+            .map(V::from_bytes)
     }
 
     /// Inserts many key-value pairs, writing each modified node to stable memory at most
