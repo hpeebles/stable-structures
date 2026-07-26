@@ -3144,15 +3144,57 @@ fn insert_many_over_existing_entries() {
 }
 
 #[test]
-fn insert_many_exercises_the_split_fallbacks() {
-    // Dense runs into a map whose leaves are already near capacity make both fallback
-    // routes fire: a full root leaf, and a parent with no room for a promoted median.
+fn insert_many_exercises_the_split_cascade() {
+    // Dense runs into a map whose leaves are already near capacity drive both cascade
+    // routes: a full root, and a parent with no room for a promoted median. The batch
+    // sizes straddle the node capacity of 11 so that splits land on the boundaries.
     for existing_len in [0u64, 5, 11, 12, 100] {
         let existing: Vec<(u64, u64)> = (0..existing_len).map(|i| (i * 100, i)).collect();
         for batch_len in [1u64, 5, 11, 12, 60, 500] {
             let batch: Vec<(u64, u64)> = (0..batch_len).map(|i| (i, i)).collect();
             assert_insert_many_matches(&existing, &batch, 0);
             assert_insert_many_matches(&existing, &batch, 16);
+        }
+    }
+}
+
+#[test]
+fn insert_many_grows_the_tree_through_repeated_root_splits() {
+    // Enough keys to push the root down several levels, so the cascade has to grow a new
+    // root more than once and re-index the levels below each split it performs. Draining
+    // the map afterwards is the structural check: a mislinked child or a stale index would
+    // strand nodes and leave the allocator holding chunks.
+    for descending in [false, true] {
+        for cache_slots in [0, 16] {
+            let n = 20_000u64;
+            let keys: Vec<u64> = if descending {
+                (0..n).rev().collect()
+            } else {
+                (0..n).collect()
+            };
+
+            let mut map: BTreeMap<u64, u64, _> =
+                BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+            map.insert_many(keys.iter().map(|k| (*k, k * 2)));
+
+            let label = format!("descending={descending} cache={cache_slots}");
+            assert_eq!(map.len(), n, "{label}");
+            assert_eq!(map.first_key_value(), Some((0, 0)), "{label}");
+            assert_eq!(map.last_key_value(), Some((n - 1, (n - 1) * 2)), "{label}");
+
+            // Every key readable, and in order.
+            let entries = collect_entry(map.iter());
+            assert_eq!(entries.len(), n as usize, "{label}");
+            for (i, (key, value)) in entries.into_iter().enumerate() {
+                assert_eq!(key, i as u64, "{label}");
+                assert_eq!(value, i as u64 * 2, "{label}");
+            }
+
+            for key in 0..n {
+                assert_eq!(map.remove(&key), Some(key * 2), "{label} key {key}");
+            }
+            assert!(map.is_empty(), "{label}");
+            assert_eq!(map.allocator.num_allocated_chunks(), 0, "{label}");
         }
     }
 }

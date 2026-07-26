@@ -751,14 +751,14 @@ benches:
   btreemap_v2_insert_many_desc_u64_u64:
     total:
       calls: 1
-      instructions: 96583320
+      instructions: 52532247
       heap_increase: 0
       stable_memory_increase: 8
     scopes: {}
   btreemap_v2_insert_many_into_existing_u64_u64:
     total:
       calls: 1
-      instructions: 48936213
+      instructions: 49329549
       heap_increase: 0
       stable_memory_increase: 0
     scopes: {}
@@ -772,21 +772,21 @@ benches:
   btreemap_v2_insert_many_seq_u64_u64:
     total:
       calls: 1
-      instructions: 77168556
+      instructions: 35883157
       heap_increase: 0
       stable_memory_increase: 8
     scopes: {}
   btreemap_v2_insert_many_sorted_random_u64_u64:
     total:
       calls: 1
-      instructions: 86706751
+      instructions: 45421352
       heap_increase: 3
       stable_memory_increase: 8
     scopes: {}
   btreemap_v2_insert_many_unsorted_u64_u64:
     total:
       calls: 1
-      instructions: 341011825
+      instructions: 336928720
       heap_increase: 0
       stable_memory_increase: 6
     scopes: {}

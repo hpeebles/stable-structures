@@ -63,7 +63,7 @@ where
 {
     map: &'a mut BTreeMap<K, V, M>,
 
-    /// Root first, leaf last. Empty before the first insert and after a fallback.
+    /// Root first, leaf last. Empty only before the first insert.
     path: Vec<PathLevel<K>>,
 
     /// Whether `length` or `root_addr` changed and the header still needs writing.
@@ -210,18 +210,8 @@ where
             .expect("bottom is a leaf here")
             .node
             .is_full()
-            && !self.split_leaf(&key)
         {
-            // The split could not be done in place. Write everything back and let the
-            // ordinary insert path grow the tree, then start a new path for the next key.
-            // The key is absent, so nothing is deserialized to build the discarded return.
-            self.release_path();
-            self.map.insert(key, value);
-            // `insert` saves the header itself on every path that moves `length` or
-            // `root_addr`, so this only guards against that ceasing to be true. It costs at
-            // most one extra header write for the whole batch.
-            self.header_dirty = true;
-            return;
+            self.split_leaf(&key);
         }
 
         // A split leaves both halves at the minimum size, so there is room now.
@@ -237,40 +227,76 @@ where
         self.header_dirty = true;
     }
 
-    /// Splits the full leaf at the bottom of the path in two and promotes the median into
-    /// the parent, leaving the path pointing at whichever half now owns `key`.
+    /// Makes room for `key` in the full leaf at the bottom of the path.
     ///
-    /// Returns `false` without touching anything when the split cannot be done here — the
-    /// leaf is the root, or the parent has no room for the median — leaving the caller to
-    /// fall back to [`BTreeMap::insert`], which grows the tree.
-    fn split_leaf(&mut self, key: &K) -> bool {
-        let depth_of_path = self.path.len();
-        if depth_of_path < 2 || self.path[depth_of_path - 2].node.is_full() {
-            return false;
+    /// A leaf split promotes a median into the parent, which may itself be full, so the
+    /// split cascades up the path through every full ancestor — growing a new root if the
+    /// whole path is full. Afterwards the bottom of the path is the half that owns `key`,
+    /// with room for it.
+    fn split_leaf(&mut self, key: &K) {
+        // Find the topmost level that has to split. Everything from there down to the leaf
+        // is full, so none of them has anywhere to promote a median until the level above
+        // it has split and made room.
+        let mut topmost = self.path.len() - 1;
+        while topmost > 0 && self.path[topmost - 1].node.is_full() {
+            topmost -= 1;
         }
 
-        let PathLevel {
-            node: mut left,
-            index_in_parent,
-            lower,
-            upper,
-            depth,
-            ..
-        } = self
-            .path
-            .pop()
-            .expect("checked that the path has a parent level");
+        if topmost == 0 {
+            // The root is full too, so the tree gains a level and everything already on the
+            // path moves one deeper.
+            self.grow_root();
+            topmost = 1;
+        }
 
-        let mut right = self.map.allocate_node(NodeType::Leaf);
-        let (median_key, median_value) = left.split(&mut right, self.map.memory());
+        // Split downwards. Each split leaves its node half empty, so by the time the level
+        // below it splits, there is room for the median it promotes.
+        for level in topmost..self.path.len() {
+            self.split_level(level, key);
+        }
+    }
 
-        let parent = self
-            .path
-            .last_mut()
-            .expect("checked that the path has a parent level");
-        parent
-            .node
-            .insert_child(index_in_parent + 1, right.address());
+    /// Inserts a fresh internal root above the current one, leaving the tree a level deeper
+    /// and the path a level longer. The new root holds the old one as its only child, and
+    /// so has room for the median about to be promoted into it.
+    fn grow_root(&mut self) {
+        let old_root = self.path[0].node.address();
+        let mut root = self.map.allocate_node(NodeType::Internal);
+        root.push_child(old_root);
+        self.map.root_addr = root.address();
+        self.header_dirty = true;
+
+        for level in self.path.iter_mut() {
+            level.depth = level.depth.saturating_add(1);
+        }
+        self.path.insert(
+            0,
+            PathLevel {
+                node: root,
+                index_in_parent: 0,
+                lower: None,
+                upper: None,
+                depth: 0,
+                dirty: true,
+            },
+        );
+    }
+
+    /// Splits the full node at `path[index]` in two and promotes the median into its
+    /// parent, which must have room. The path keeps whichever half owns `key`; the other
+    /// half is finished with and is written out.
+    fn split_level(&mut self, index: usize, key: &K) {
+        debug_assert!(index > 0, "the root splits only after `grow_root`");
+        debug_assert!(!self.path[index - 1].node.is_full());
+        debug_assert!(self.path[index].node.is_full());
+
+        let mut right = self.map.allocate_node(self.path[index].node.node_type());
+        let right_addr = right.address();
+        let (median_key, median_value) = self.path[index].node.split(&mut right, self.map.memory());
+        let index_in_parent = self.path[index].index_in_parent;
+
+        let parent = &mut self.path[index - 1];
+        parent.node.insert_child(index_in_parent + 1, right_addr);
         parent
             .node
             .insert_entry(index_in_parent, (median_key.clone(), median_value));
@@ -279,21 +305,33 @@ where
         // Keep whichever half the key belongs to; the other one is finished with. The key
         // cannot equal the median, which was already in the tree while the key was not.
         // The median becomes the boundary between the two halves.
-        let (keep, mut done, keep_index, keep_lower, keep_upper) = if *key < median_key {
-            (left, right, index_in_parent, lower, Some(median_key))
+        //
+        // The levels below keep the bounds they already have: the separators either side of
+        // them survive the split, they just end up in one half or the other.
+        if *key < median_key {
+            // The left half stays where it is, since `split` left it in place.
+            let level = &mut self.path[index];
+            level.upper = Some(median_key);
+            level.dirty = true;
+            self.map.save_node(&mut right);
         } else {
-            (right, left, index_in_parent + 1, Some(median_key), upper)
-        };
-        self.map.save_node(&mut done);
-        self.path.push(PathLevel {
-            node: keep,
-            index_in_parent: keep_index,
-            lower: keep_lower,
-            upper: keep_upper,
-            depth,
-            dirty: true,
-        });
-        true
+            let (mut left, moved_children) = {
+                let level = &mut self.path[index];
+                let left = core::mem::replace(&mut level.node, right);
+                level.index_in_parent = index_in_parent + 1;
+                level.lower = Some(median_key);
+                level.dirty = true;
+                let moved_children = left.children_len();
+                (left, moved_children)
+            };
+            self.map.save_node(&mut left);
+
+            // The level below travelled with the entries into the right half, so it sits at
+            // a lower index among its parent's children than it did before.
+            if let Some(below) = self.path.get_mut(index + 1) {
+                below.index_in_parent -= moved_children;
+            }
+        }
     }
 }
 
