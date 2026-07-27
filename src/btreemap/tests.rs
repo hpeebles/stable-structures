@@ -3630,3 +3630,62 @@ fn insert_many_preserves_the_btree_invariants() {
         );
     }
 }
+
+// --- insert_many + entry, together --------------------------------------------------
+
+/// The two features are developed on separate branches and only meet here, so check that a
+/// map built by `insert_many` behaves normally under the `entry` API and vice versa. This
+/// matters because `insert_many` holds a root-to-leaf path open and writes nodes lazily,
+/// while `entry` splits full nodes eagerly on the way down — each has its own idea of when
+/// the tree is written, and they must agree on the result.
+#[test]
+fn entry_api_works_on_a_map_built_by_insert_many() {
+    use crate::btreemap::entry::Entry;
+
+    let n = 5_000u64;
+    let mut map: BTreeMap<u64, u64, _> = BTreeMap::new(make_memory());
+    map.insert_many((0..n).map(|i| (i * 2, i)));
+
+    // Occupied and vacant probes both land correctly on a batch-built tree.
+    for i in 0..n {
+        match map.entry(i * 2) {
+            Entry::Occupied(e) => assert_eq!(e.get(), i, "key {}", i * 2),
+            Entry::Vacant(_) => panic!("key {} should be present", i * 2),
+        }
+        match map.entry(i * 2 + 1) {
+            Entry::Vacant(_) => {}
+            Entry::Occupied(_) => panic!("key {} should be absent", i * 2 + 1),
+        }
+    }
+
+    // Mutating through `entry` on top of a batch-built tree.
+    for i in 0..n {
+        map.entry(i * 2).and_modify(|v| *v += 1_000_000);
+    }
+    for i in 0..n {
+        assert_eq!(map.get(&(i * 2)), Some(i + 1_000_000));
+    }
+
+    // `or_insert` fills the gaps, growing the tree through the entry path.
+    for i in 0..n {
+        map.entry(i * 2 + 1).or_insert(i);
+    }
+    assert_eq!(map.len(), n * 2);
+
+    // And a batch on top of a tree that `entry` has been splitting.
+    map.insert_many((n * 2..n * 3).map(|i| (i, i)));
+    assert_eq!(map.len(), n * 3);
+
+    let entries = collect_entry(map.iter());
+    assert_eq!(entries.len(), (n * 3) as usize);
+    for (i, (key, _)) in entries.iter().enumerate() {
+        assert_eq!(*key, i as u64, "iteration order");
+    }
+
+    // Drain to empty: a tree the two features built together must still be sound.
+    for (key, _) in entries {
+        assert!(map.remove(&key).is_some(), "key {key}");
+    }
+    assert!(map.is_empty());
+    assert_eq!(map.allocator.num_allocated_chunks(), 0);
+}
