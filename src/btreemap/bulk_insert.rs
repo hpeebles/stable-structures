@@ -4,6 +4,21 @@
 //! root-to-leaf path in memory, so that each modified node is written to stable memory
 //! once the input moves past it rather than once per key. [`BulkInsert`] is that held
 //! path, and [`PathLevel`] is one level of it.
+//!
+//! # Attributing the cost
+//!
+//! Building with the `bench_scope` feature splits a batch into four canbench scopes:
+//!
+//! - `bulk_insert_release` — a node leaving the path: written out if dirty, else returned
+//!   to the node cache
+//! - `bulk_insert_descend` — taking one child out of the cache and recording its bounds
+//! - `bulk_insert_leaf` — placing the entry, *including* any split it triggers
+//! - `bulk_insert_split` — the split cascade, nested inside the previous one
+//!
+//! So the cost of placing an entry with no split is `bulk_insert_leaf` minus
+//! `bulk_insert_split`. The feature is off by default and adds significant overhead, so
+//! the numbers are for comparing parts against each other within one run, not against
+//! results measured without it.
 
 use crate::btreemap::node::{Node, NodeType};
 use crate::types::NULL;
@@ -87,6 +102,9 @@ where
     /// Releases a node that has left the path: written out if modified, handed back to the
     /// node cache otherwise.
     fn release(&mut self, level: PathLevel<K>) {
+        #[cfg(feature = "bench_scope")]
+        let _p = canbench_rs::bench_scope("bulk_insert_release"); // May add significant overhead.
+
         let mut node = level.node;
         if level.dirty {
             self.map.save_node(&mut node);
@@ -157,6 +175,9 @@ where
 
     /// Descends one level, into the child at `idx` of the node currently at the bottom.
     fn push_child(&mut self, idx: usize) {
+        #[cfg(feature = "bench_scope")]
+        let _p = canbench_rs::bench_scope("bulk_insert_descend"); // May add significant overhead.
+
         let (address, lower, upper, depth) = {
             let bottom = self.path.last().expect("only called while descending");
             // The separators either side of this child bound the keys it may hold; beyond
@@ -192,6 +213,11 @@ where
     /// Places `key` in the leaf at the bottom of the path, splitting it first if it is
     /// full.
     fn insert_into_leaf(&mut self, key: K, value: V) {
+        // Encloses `bulk_insert_split`, so subtract that to get the cost of placing the
+        // entry alone.
+        #[cfg(feature = "bench_scope")]
+        let _p = canbench_rs::bench_scope("bulk_insert_leaf"); // May add significant overhead.
+
         let search = {
             let leaf = self.path.last().expect("bottom is a leaf here");
             leaf.node.search(&key, self.map.memory())
@@ -234,6 +260,9 @@ where
     /// whole path is full. Afterwards the bottom of the path is the half that owns `key`,
     /// with room for it.
     fn split_leaf(&mut self, key: &K) {
+        #[cfg(feature = "bench_scope")]
+        let _p = canbench_rs::bench_scope("bulk_insert_split"); // May add significant overhead.
+
         // Find the topmost level that has to split. Everything from there down to the leaf
         // is full, so none of them has anywhere to promote a median until the level above
         // it has split and made room.
