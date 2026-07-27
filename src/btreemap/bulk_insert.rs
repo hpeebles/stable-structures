@@ -223,14 +223,17 @@ where
             leaf.node.search(&key, self.map.memory())
         };
 
-        if let Ok(idx) = search {
-            let leaf = self.path.last_mut().expect("checked above");
-            leaf.node.set_value(idx, value.into_bytes_checked());
-            leaf.dirty = true;
-            return;
-        }
+        let idx = match search {
+            Ok(idx) => {
+                let leaf = self.path.last_mut().expect("checked above");
+                leaf.node.set_value(idx, value.into_bytes_checked());
+                leaf.dirty = true;
+                return;
+            }
+            Err(idx) => idx,
+        };
 
-        if self
+        let idx = if self
             .path
             .last()
             .expect("bottom is a leaf here")
@@ -238,14 +241,21 @@ where
             .is_full()
         {
             self.split_leaf(&key);
-        }
+            // The split moved half the entries out and may have swapped in the other half
+            // entirely, so the position found above no longer means anything. Both halves
+            // are at the minimum size, so there is room for the key wherever it now lands.
+            self.path
+                .last()
+                .expect("bottom is a leaf here")
+                .node
+                .search(&key, self.map.memory())
+                .expect_err("the key was absent and a split cannot introduce it")
+        } else {
+            // Nothing has touched the leaf since the search above, so reuse its answer.
+            idx
+        };
 
-        // A split leaves both halves at the minimum size, so there is room now.
         let leaf = self.path.last_mut().expect("bottom is a leaf here");
-        let idx = leaf
-            .node
-            .search(&key, self.map.memory())
-            .expect_err("the key was absent and a split cannot introduce it");
         leaf.node
             .insert_entry(idx, (key, value.into_bytes_checked()));
         leaf.dirty = true;
