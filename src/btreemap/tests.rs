@@ -1,10 +1,12 @@
 use super::*;
 use crate::{
     btreemap::iter::LazyEntry,
+    btreemap::node::{B, CAPACITY},
     storable::{Blob, Bound as StorableBound},
     VectorMemory,
 };
 use std::cell::RefCell;
+use std::collections::{BTreeMap as StdBTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::rc::Rc;
 
@@ -3380,6 +3382,251 @@ fn insert_many_coalesces_in_either_direction() {
             collect_entry(expected.iter()),
             collect_entry(actual.iter()),
             "descending={descending}"
+        );
+    }
+}
+
+// --- structural invariants ----------------------------------------------------------
+
+/// Reads the tree back out of memory and asserts every structural invariant a B-tree has.
+///
+/// The other tests check behaviour — that iteration matches `std`, that lookups agree,
+/// that draining returns every allocator chunk — and so notice corruption only through
+/// its consequences. `insert_many` manipulates the shape directly when it splits a node
+/// and cascades the split upwards, so it is worth asserting the shape itself: a mislinked
+/// child or a stale index shows up here at the node it broke, rather than downstream as a
+/// missing key.
+fn assert_btree_invariants<K, V, M>(map: &BTreeMap<K, V, M>, ctx: &str)
+where
+    K: Storable + Ord + Clone + std::fmt::Debug,
+    V: Storable,
+    M: Memory,
+{
+    if map.root_addr == NULL {
+        assert_eq!(map.len(), 0, "{ctx}: no root, but the length is not zero");
+        return;
+    }
+
+    let mut walk = TreeWalk {
+        map,
+        ctx,
+        leaf_depths: BTreeSet::new(),
+        entries: 0,
+    };
+    walk.check(map.root_addr, 0, None, None, true);
+
+    assert_eq!(
+        walk.leaf_depths.len(),
+        1,
+        "{ctx}: the tree is unbalanced, leaves sit at depths {:?}",
+        walk.leaf_depths
+    );
+    assert_eq!(
+        walk.entries,
+        map.len(),
+        "{ctx}: walked {} entries but the header says {}",
+        walk.entries,
+        map.len()
+    );
+}
+
+struct TreeWalk<'a, K, V, M>
+where
+    K: Storable + Ord + Clone,
+    V: Storable,
+    M: Memory,
+{
+    map: &'a BTreeMap<K, V, M>,
+    ctx: &'a str,
+    leaf_depths: BTreeSet<u32>,
+    entries: u64,
+}
+
+impl<K, V, M> TreeWalk<'_, K, V, M>
+where
+    K: Storable + Ord + Clone + std::fmt::Debug,
+    V: Storable,
+    M: Memory,
+{
+    /// Checks the node at `address` and everything below it. `lower` and `upper` are the
+    /// separators either side of it in its parent, which every key beneath it must fall
+    /// strictly between.
+    fn check(
+        &mut self,
+        address: Address,
+        depth: u32,
+        lower: Option<K>,
+        upper: Option<K>,
+        is_root: bool,
+    ) {
+        let ctx = self.ctx;
+        let node = self.map.load_node(address);
+        let len = node.entries_len();
+
+        assert!(len > 0, "{ctx}: empty node at depth {depth}");
+        assert!(
+            len <= CAPACITY,
+            "{ctx}: node at depth {depth} holds {len} entries, over the capacity of {CAPACITY}"
+        );
+        if !is_root {
+            assert!(
+                len >= B - 1,
+                "{ctx}: node at depth {depth} holds only {len} entries, under the minimum of {}",
+                B - 1
+            );
+        }
+
+        let keys: Vec<K> = (0..len)
+            .map(|i| node.key(i, self.map.memory()).clone())
+            .collect();
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{ctx}: keys out of order at depth {depth}: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        if let Some(lower) = &lower {
+            assert!(
+                &keys[0] > lower,
+                "{ctx}: key {:?} at depth {depth} is not above its separator {lower:?}",
+                keys[0]
+            );
+        }
+        if let Some(upper) = &upper {
+            assert!(
+                &keys[len - 1] < upper,
+                "{ctx}: key {:?} at depth {depth} is not below its separator {upper:?}",
+                keys[len - 1]
+            );
+        }
+        self.entries += len as u64;
+
+        match node.node_type() {
+            NodeType::Leaf => {
+                assert_eq!(
+                    node.children_len(),
+                    0,
+                    "{ctx}: leaf at depth {depth} has children"
+                );
+                self.leaf_depths.insert(depth);
+            }
+            NodeType::Internal => {
+                assert_eq!(
+                    node.children_len(),
+                    len + 1,
+                    "{ctx}: internal node at depth {depth} has {} children for {len} entries",
+                    node.children_len()
+                );
+                for i in 0..=len {
+                    let child_lower = if i == 0 {
+                        lower.clone()
+                    } else {
+                        Some(keys[i - 1].clone())
+                    };
+                    let child_upper = if i == len {
+                        upper.clone()
+                    } else {
+                        Some(keys[i].clone())
+                    };
+                    self.check(node.child(i), depth + 1, child_lower, child_upper, false);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn insert_many_preserves_the_btree_invariants() {
+    // Batches of varying shape, interleaved with the ordinary single-key operations, so
+    // that trees built by one are reshaped by the other. The tree is walked after every
+    // step, which is what makes this stronger than comparing iteration order: a split that
+    // linked a child wrongly is caught at that node rather than wherever it surfaces.
+    for seed in 0..12u64 {
+        let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let cache_slots = [0usize, 1, 16][(seed % 3) as usize];
+        let mut actual: BTreeMap<u64, u64, _> =
+            BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+        let mut expected = StdBTreeMap::new();
+
+        for step in 0..20 {
+            let ctx = format!("seed {seed} step {step} cache {cache_slots}");
+            let base = next() % 4_000;
+            let span = 1 + next() % 2_500;
+
+            match next() % 8 {
+                0..=4 => {
+                    let len = 1 + next() % 300;
+                    let mut keys: Vec<u64> = (0..len).map(|_| base + next() % span).collect();
+                    match next() % 3 {
+                        0 => keys.sort_unstable(),
+                        1 => {
+                            keys.sort_unstable();
+                            keys.reverse();
+                        }
+                        _ => {} // leave it shuffled
+                    }
+                    for key in &keys {
+                        expected.insert(*key, key.wrapping_mul(31));
+                    }
+                    actual.insert_many(keys.iter().map(|k| (*k, k.wrapping_mul(31))));
+                }
+                5 => {
+                    let key = base + next() % span;
+                    let value = next();
+                    assert_eq!(
+                        actual.insert(key, value),
+                        expected.insert(key, value),
+                        "{ctx}: insert {key}"
+                    );
+                }
+                6 => {
+                    let key = base + next() % span;
+                    assert_eq!(
+                        actual.remove(&key),
+                        expected.remove(&key),
+                        "{ctx}: remove {key}"
+                    );
+                }
+                _ => {
+                    for key in expected.keys().copied().take(40).collect::<Vec<_>>() {
+                        assert_eq!(
+                            actual.remove(&key),
+                            expected.remove(&key),
+                            "{ctx}: drain {key}"
+                        );
+                    }
+                }
+            }
+
+            assert_btree_invariants(&actual, &ctx);
+            assert_eq!(actual.len() as usize, expected.len(), "{ctx}: length");
+            assert_eq!(
+                collect_entry(actual.iter()),
+                expected.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+                "{ctx}: contents"
+            );
+        }
+
+        // Everything the batches put in must come back out.
+        for key in expected.keys().copied().collect::<Vec<_>>() {
+            assert!(
+                actual.remove(&key).is_some(),
+                "seed {seed}: final drain {key}"
+            );
+        }
+        assert!(actual.is_empty(), "seed {seed}");
+        assert_eq!(
+            actual.allocator.num_allocated_chunks(),
+            0,
+            "seed {seed}: chunks left allocated"
         );
     }
 }
