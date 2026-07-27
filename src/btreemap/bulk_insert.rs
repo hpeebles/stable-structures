@@ -368,6 +368,10 @@ where
             // The level below travelled with the entries into the right half, so it sits at
             // a lower index among its parent's children than it did before.
             if let Some(below) = self.path.get_mut(index + 1) {
+                // It has to have been in the right half: it covers `key`, and `key` is
+                // above the median, so its index was at least the number of children the
+                // left half kept.
+                debug_assert!(below.index_in_parent >= moved_children);
                 below.index_in_parent -= moved_children;
             }
         }
