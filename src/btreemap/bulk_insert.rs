@@ -354,14 +354,14 @@ where
             level.dirty = true;
             self.map.save_node(&mut right);
         } else {
-            let (mut left, moved_children) = {
+            let (mut left, children_kept_left) = {
                 let level = &mut self.path[index];
                 let left = core::mem::replace(&mut level.node, right);
                 level.index_in_parent = index_in_parent + 1;
                 level.lower = Some(median_key);
                 level.dirty = true;
-                let moved_children = left.children_len();
-                (left, moved_children)
+                let children_kept_left = left.children_len();
+                (left, children_kept_left)
             };
             self.map.save_node(&mut left);
 
@@ -371,8 +371,8 @@ where
                 // It has to have been in the right half: it covers `key`, and `key` is
                 // above the median, so its index was at least the number of children the
                 // left half kept.
-                debug_assert!(below.index_in_parent >= moved_children);
-                below.index_in_parent -= moved_children;
+                debug_assert!(below.index_in_parent >= children_kept_left);
+                below.index_in_parent -= children_kept_left;
             }
         }
     }
