@@ -309,3 +309,32 @@ fn can_call_node_value_multiple_times_on_same_index() {
     let value2 = node.value(0, &mem);
     assert_eq!(value1, value2);
 }
+
+#[test]
+fn loading_near_the_end_of_memory_clamps_the_batched_read() {
+    use crate::storable::Blob;
+
+    // A bounded-key node placed so that the load's batched-read estimate extends past
+    // the last byte of memory: the read must clamp to the memory's end rather than
+    // trap. (The node's own bytes always fit — the save wrote them — it is only the
+    // estimate, an upper bound based on the key bound, that can overshoot.)
+    let mem = make_memory();
+    let page_size = PageSize::Value(128);
+    // The allocator's header write grows the memory to exactly one Wasm page.
+    let mut allocator = Allocator::new(mem.clone(), Address::from(0), Bytes::from(128u64));
+
+    // The node occupies 27 bytes (header 15, key size 4, key 4, value size 4), and its
+    // batched-read estimate is 55 bytes (header 15, key bound 32 + size field 4, value
+    // size 4). Placing it 30 bytes from the end fits the node but not the estimate.
+    let node_addr = Address::from(crate::WASM_PAGE_SIZE - 30);
+    let mut node: Node<Blob<32>> = Node::new_v2(node_addr, NodeType::Leaf, page_size);
+    node.push_entry((Blob::try_from(&[7u8; 4][..]).unwrap(), vec![]));
+    node.save_v2(&mut allocator);
+    assert_eq!(mem.size(), 1);
+
+    let node = Node::<Blob<32>>::load(node_addr, page_size, &mem);
+    assert_eq!(
+        node.entries(&mem),
+        vec![(Blob::try_from(&[7u8; 4][..]).unwrap(), vec![])]
+    );
+}
