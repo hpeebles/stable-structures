@@ -281,22 +281,6 @@ impl<'a, M: Memory> NodeWriter<'a, M> {
         }
     }
 
-    pub fn write_u32(&mut self, offset: Address, val: u32) {
-        self.write(offset, &val.to_le_bytes());
-    }
-
-    pub fn write_u64(&mut self, offset: Address, val: u64) {
-        self.write(offset, &val.to_le_bytes());
-    }
-
-    pub fn write_struct<T>(&mut self, t: &T, addr: Address) {
-        let slice = unsafe {
-            core::slice::from_raw_parts(t as *const _ as *const u8, core::mem::size_of::<T>())
-        };
-
-        self.write(addr, slice)
-    }
-
     // Allocates a new page and appends it to the node's overflows.
     fn allocate_new_page(&mut self) {
         let new_page = self.allocator.allocate();
