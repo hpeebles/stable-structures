@@ -444,6 +444,31 @@ where
         self.map.remove(key).is_some()
     }
 
+    /// Removes many keys, writing each modified node to stable memory at most once instead
+    /// of once per key. See [`BTreeMap::remove_many`] for the details.
+    ///
+    /// Supply the keys in sorted order, ascending for best results, for the coalescing to
+    /// pay off. Out-of-order keys are handled correctly but forfeit the speedup. Keys not in
+    /// the set are skipped.
+    ///
+    /// The iterator is consumed lazily and never collected.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use ic_stable_structures::{BTreeSet, DefaultMemoryImpl};
+    ///
+    /// let mut set: BTreeSet<u64, _> = BTreeSet::new(DefaultMemoryImpl::default());
+    /// set.insert_many(0..1_000);
+    /// set.remove_many(100..900);
+    ///
+    /// assert_eq!(set.len(), 200);
+    /// assert!(!set.contains(&500));
+    /// ```
+    pub fn remove_many<Q: core::borrow::Borrow<K>>(&mut self, keys: impl IntoIterator<Item = Q>) {
+        self.map.remove_many(keys);
+    }
+
     /// Removes and returns the last element in the set. The key of this element is the maximum key that was in the set.
     ///
     /// # Complexity
@@ -1312,6 +1337,36 @@ mod test {
         btreeset.insert_many(Vec::new());
         assert_eq!(btreeset.len(), 1);
         assert!(btreeset.contains(&1));
+    }
+
+    #[test]
+    fn test_remove_many_matches_repeated_remove() {
+        // Ascending, descending, unordered, repeated and absent keys must all leave the set
+        // in exactly the state repeated `remove` calls would.
+        let n = 1_000u32;
+        let batches: Vec<(&str, Vec<u32>)> = vec![
+            ("ascending", (0..n).collect()),
+            ("descending", (0..n).rev().collect()),
+            ("sawtooth", (0..n).map(|i| (i * 7) % n).collect()),
+            ("a run", (300..700).collect()),
+            ("repeated and absent", vec![1, 2, 1, 3, 2, 1, n + 5]),
+        ];
+
+        for (label, batch) in batches {
+            let mut expected: BTreeSet<u32, _> = BTreeSet::new(make_memory());
+            let mut actual: BTreeSet<u32, _> = BTreeSet::new(make_memory());
+            expected.insert_many(0..n);
+            actual.insert_many(0..n);
+            for key in &batch {
+                expected.remove(key);
+            }
+            actual.remove_many(&batch);
+
+            assert_eq!(actual.len(), expected.len(), "{label}");
+            let actual_keys: Vec<u32> = actual.iter().collect();
+            let expected_keys: Vec<u32> = expected.iter().collect();
+            assert_eq!(actual_keys, expected_keys, "{label}");
+        }
     }
 
     #[test]

@@ -50,10 +50,12 @@
 //! ```
 mod allocator;
 mod bulk_insert;
+mod bulk_remove;
 pub mod entry;
 mod iter;
 mod node;
 mod node_cache;
+mod path;
 use crate::btreemap::iter::{IterInternal, KeysIter, ValuesIter};
 use crate::{
     storable::Bound as StorableBound,
@@ -62,6 +64,7 @@ use crate::{
 };
 use allocator::Allocator;
 use bulk_insert::BulkInsert;
+use bulk_remove::BulkRemove;
 pub use iter::Iter;
 use node::{DerivedPageSize, Node, NodeType, PageSize, Version, MINIMUM_PAGE_SIZE};
 use node_cache::NodeCache;
@@ -1351,6 +1354,62 @@ where
         self.remove_helper(root_node, key, 0)
             .map(Cow::Owned)
             .map(V::from_bytes)
+    }
+
+    /// Removes many keys, writing each modified node to stable memory at most once instead
+    /// of once per key.
+    ///
+    /// [`remove`](Self::remove) writes the node it removes from on every call, and keeps
+    /// every node on the way down above the minimum size by merging or rotating with a
+    /// sibling first, which writes the sibling and the parent too. Removing a run of nearby
+    /// keys therefore rewrites the same nodes again and again. `remove_many` instead keeps
+    /// the current root-to-leaf path in memory, lets the leaf it is removing from fall below
+    /// the minimum while it is held, and puts it right once, as the input moves past it. A
+    /// modified node is saved only then, and the header once for the whole call rather than
+    /// once per key.
+    ///
+    /// The iterator is consumed lazily and never collected, so the memory cost is one tree
+    /// path however many keys are supplied. Keys that are not in the map are skipped, as
+    /// are repeats of a key already removed. The map is left holding the same entries
+    /// repeated `remove` calls would leave, though its nodes may be shaped differently,
+    /// since the two can merge different pairs of nodes.
+    ///
+    /// Keys can be given by value or by reference.
+    ///
+    /// # Supply keys in sorted order for best performance
+    ///
+    /// The coalescing pays off exactly when consecutive keys land in the same node, so
+    /// **feed the keys in sorted order**, ascending for best results: a key that sits in an
+    /// internal node is replaced by its successor, which takes the path down the subtree
+    /// an ascending batch visits next.
+    ///
+    /// Out-of-order keys are still handled correctly — the path unwinds to an ancestor that
+    /// covers the key, as far as the root if necessary — but each one costs a fresh
+    /// descent, and shuffled input performs no better than calling
+    /// [`remove`](Self::remove) in a loop. Sort first if the keys are not already ordered.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ic_stable_structures::{BTreeMap, DefaultMemoryImpl};
+    ///
+    /// let mut map: BTreeMap<u64, u64, _> = BTreeMap::new(DefaultMemoryImpl::default());
+    /// map.insert_many((0..1_000).map(|i| (i, i * 2)));
+    ///
+    /// // Every even key, streamed straight from the iterator.
+    /// map.remove_many((0..1_000).step_by(2));
+    ///
+    /// assert_eq!(map.len(), 500);
+    /// assert_eq!(map.get(&2), None);
+    /// assert_eq!(map.get(&3), Some(6));
+    /// ```
+    pub fn remove_many<Q: std::borrow::Borrow<K>>(&mut self, keys: impl IntoIterator<Item = Q>) {
+        let mut bulk = BulkRemove::new(self);
+        for key in keys {
+            bulk.remove(key.borrow());
+        }
+        // Dropping `bulk` here puts right and writes out the path it is still holding,
+        // along with the header. That is what completes the batch.
     }
 
     /// Removes and returns the last element in the map. The key of this element is the maximum key that was in the map

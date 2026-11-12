@@ -20,48 +20,10 @@
 //! the numbers are for comparing parts against each other within one run, not against
 //! results measured without it.
 
-use crate::btreemap::node::{Node, NodeType};
+use crate::btreemap::node::NodeType;
+use crate::btreemap::path::PathLevel;
 use crate::types::NULL;
 use crate::{BTreeMap, Memory, Storable};
-
-/// One level of the root-to-leaf path that [`BTreeMap::insert_many`] holds open across a
-/// run of inserts.
-struct PathLevel<K: Storable + Ord + Clone> {
-    node: Node<K>,
-
-    /// Index of this node among its parent's children. Meaningless for the root.
-    index_in_parent: usize,
-
-    /// The key range this node is responsible for, taken from the separators either side of
-    /// it while descending. Both ends are exclusive, because a separator key is stored in
-    /// the parent rather than the child. `None` means unbounded on that side, which is
-    /// always the case for the root.
-    ///
-    /// Both ends are tracked, not just the upper one, so that a key arriving out of order
-    /// is detected rather than being dropped into the wrong node. See [`PathLevel::covers`].
-    lower: Option<K>,
-    upper: Option<K>,
-
-    /// Distance from the root, needed when handing the node back to the node cache.
-    depth: u8,
-
-    /// Whether the node has been modified and so must be written out, rather than simply
-    /// returned to the cache, when it leaves the path.
-    dirty: bool,
-}
-
-impl<K: Storable + Ord + Clone> PathLevel<K> {
-    /// Whether `key` belongs somewhere under this node.
-    ///
-    /// For an ascending batch only the upper bound can ever fail, and that is the case this
-    /// is tuned for. The lower bound is checked too so that an out-of-order key unwinds
-    /// past this node — as far as the root if need be — instead of being inserted here,
-    /// which would break the ordering invariant of the tree.
-    fn covers(&self, key: &K) -> bool {
-        self.lower.as_ref().is_none_or(|lower| lower < key)
-            && self.upper.as_ref().is_none_or(|upper| key < upper)
-    }
-}
 
 /// Inserts a stream of keys while keeping the current root-to-leaf path in
 /// memory, so that each modified node is written to stable memory once the batch moves
@@ -180,18 +142,7 @@ where
 
         let (address, lower, upper, depth) = {
             let bottom = self.path.last().expect("only called while descending");
-            // The separators either side of this child bound the keys it may hold; beyond
-            // the outermost separator the child inherits its parent's bound.
-            let lower = if idx > 0 {
-                Some(bottom.node.key(idx - 1, self.map.memory()).clone())
-            } else {
-                bottom.lower.clone()
-            };
-            let upper = if idx < bottom.node.entries_len() {
-                Some(bottom.node.key(idx, self.map.memory()).clone())
-            } else {
-                bottom.upper.clone()
-            };
+            let (lower, upper) = bottom.child_bounds(idx, self.map.memory());
             (
                 bottom.node.child(idx),
                 lower,

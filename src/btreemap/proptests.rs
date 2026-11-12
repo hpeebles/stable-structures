@@ -680,3 +680,104 @@ fn insert_many_does_not_leak_memory(
     assert!(btree.is_empty());
     assert_eq!(btree.allocator.num_allocated_chunks(), 0);
 }
+
+// `remove_many` must leave the same entries as calling `remove` on each key, whatever the
+// batch looks like: unsorted, repeated, absent from the map, and whatever the node cache
+// is doing.
+#[proptest(cases = 30)]
+fn remove_many_matches_repeated_remove(
+    #[strategy(pvec(0..400u64, 0..400))] existing: Vec<u64>,
+    #[strategy(pvec(0..450u64, 0..400))] batch: Vec<u64>,
+    sort: bool,
+) {
+    let mut batch = batch;
+    if sort {
+        batch.sort_unstable();
+    }
+    for cache_slots in [0usize, 1, 16] {
+        let mut expected: BTreeMap<u64, u64, _> =
+            BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+        let mut actual: BTreeMap<u64, u64, _> =
+            BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+
+        for key in &existing {
+            expected.insert(*key, *key);
+            actual.insert(*key, *key);
+        }
+
+        for key in &batch {
+            expected.remove(key);
+        }
+        actual.remove_many(&batch);
+
+        assert_eq!(expected.len(), actual.len(), "cache {cache_slots}");
+        let expected_entries: Vec<_> = expected.iter().map(|e| (*e.key(), e.value())).collect();
+        let actual_entries: Vec<_> = actual.iter().map(|e| (*e.key(), e.value())).collect();
+        assert_eq!(expected_entries, actual_entries, "cache {cache_slots}");
+
+        for key in &batch {
+            assert_eq!(actual.get(key), None, "key {key}");
+        }
+    }
+}
+
+// Variable-length keys and values exercise V2 overflow pages, and `run_btree_test` covers
+// the V1 and V1-migrated-to-V2 layouts too.
+#[proptest(cases = 20)]
+fn remove_many_matches_repeated_remove_unbounded(
+    #[strategy(pvec((pvec(0..8u8, 0..6), pvec(0..255u8, 0..300)), 0..200))] existing: Vec<(
+        Vec<u8>,
+        Vec<u8>,
+    )>,
+    #[strategy(pvec(pvec(0..8u8, 0..6), 0..200))] batch: Vec<Vec<u8>>,
+) {
+    run_btree_test(|mut actual| {
+        let mut expected = StdBTreeMap::new();
+        for (key, value) in existing.clone() {
+            actual.insert(key.clone(), value.clone());
+            expected.insert(key, value);
+        }
+        for key in &batch {
+            expected.remove(key);
+        }
+        actual.remove_many(&batch);
+
+        let actual_entries: Vec<_> = actual
+            .iter()
+            .map(|e| (e.key().clone(), e.value()))
+            .collect();
+        let expected_entries: Vec<_> = expected
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        prop_assert_eq!(actual_entries, expected_entries);
+        prop_assert_eq!(actual.len() as usize, expected.len());
+        Ok(())
+    });
+}
+
+// Every node `remove_many` merges away must go back to the allocator: draining the rest of
+// the map afterwards has to return every chunk.
+#[proptest(cases = 10)]
+fn remove_many_does_not_leak_memory(
+    #[strategy(pvec(0..2_000u64, 500..2_000))] existing: Vec<u64>,
+    #[strategy(pvec(0..2_000u64, 0..2_000))] batch: Vec<u64>,
+) {
+    let mut btree: BTreeMap<u64, u64, _> = BTreeMap::new(make_memory());
+    btree.insert_many(existing.iter().map(|k| (*k, *k)));
+    let mut batch = batch;
+    batch.sort_unstable();
+    btree.remove_many(&batch);
+
+    let left: BTreeSet<u64> = existing
+        .iter()
+        .copied()
+        .filter(|k| batch.binary_search(k).is_err())
+        .collect();
+    assert_eq!(btree.len() as usize, left.len());
+    for key in left {
+        assert!(btree.remove(&key).is_some());
+    }
+    assert!(btree.is_empty());
+    assert_eq!(btree.allocator.num_allocated_chunks(), 0);
+}

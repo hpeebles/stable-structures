@@ -3740,3 +3740,338 @@ fn entry_api_works_on_a_map_built_by_insert_many() {
     assert!(map.is_empty());
     assert_eq!(map.allocator.num_allocated_chunks(), 0);
 }
+
+// --- remove_many -------------------------------------------------------------------
+
+/// A deterministic xorshift stream, so a failure names a seed that reproduces it.
+fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}
+
+/// Takes `batch` out of a map holding `existing` twice — once with repeated `remove`, once
+/// with `remove_many` — and asserts the two maps hold the same entries, the batched one
+/// is a sound B-tree, and draining it afterwards returns every chunk to the allocator.
+///
+/// The two trees need not have the same shape: `remove` rebalances on the way down and
+/// `remove_many` on the way out, so they can merge different pairs of nodes.
+fn assert_remove_many_matches(existing: &[u64], batch: &[u64], cache_slots: usize, ctx: &str) {
+    let ctx = format!("{ctx}, cache {cache_slots}");
+    let mut expected: BTreeMap<u64, u64, _> =
+        BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+    let mut actual: BTreeMap<u64, u64, _> =
+        BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+    for key in existing {
+        expected.insert(*key, key * 3);
+        actual.insert(*key, key * 3);
+    }
+
+    for key in batch {
+        expected.remove(key);
+    }
+    actual.remove_many(batch);
+
+    assert_btree_invariants(&actual, &ctx);
+    assert_eq!(actual.len(), expected.len(), "{ctx}: length");
+    assert_eq!(
+        collect_entry(actual.iter()),
+        collect_entry(expected.iter()),
+        "{ctx}: contents"
+    );
+
+    for key in batch {
+        assert_eq!(actual.get(key), None, "{ctx}: key {key} is still there");
+    }
+    for (key, _) in collect_entry(expected.iter()) {
+        assert!(actual.remove(&key).is_some(), "{ctx}: drain {key}");
+    }
+    assert!(actual.is_empty(), "{ctx}");
+    assert_eq!(
+        actual.allocator.num_allocated_chunks(),
+        0,
+        "{ctx}: chunks left allocated"
+    );
+}
+
+#[test]
+fn remove_many_with_nothing_to_remove_is_a_no_op() {
+    assert_remove_many_matches(&[], &[], 16, "empty map, empty batch");
+    assert_remove_many_matches(&[], &[1, 2, 3], 16, "empty map");
+    let existing: Vec<u64> = (0..500).map(|i| i * 2).collect();
+    assert_remove_many_matches(&existing, &[], 16, "empty batch");
+    let absent: Vec<u64> = (0..500).map(|i| i * 2 + 1).collect();
+    assert_remove_many_matches(&existing, &absent, 16, "only absent keys");
+}
+
+#[test]
+fn remove_many_of_everything_empties_the_map() {
+    // From a lone leaf root through trees several levels deep, in both directions, so that
+    // the root is replaced level by level until it is a leaf, and then dropped.
+    for n in [1u64, 5, 11, 12, 30, 100, 1_000, 6_000] {
+        let existing: Vec<u64> = (0..n).collect();
+        let descending: Vec<u64> = (0..n).rev().collect();
+        for cache_slots in [0, 16] {
+            assert_remove_many_matches(
+                &existing,
+                &existing,
+                cache_slots,
+                &format!("{n} ascending"),
+            );
+            assert_remove_many_matches(
+                &existing,
+                &descending,
+                cache_slots,
+                &format!("{n} descending"),
+            );
+
+            let mut map: BTreeMap<u64, u64, _> =
+                BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+            map.insert_many(existing.iter().map(|k| (*k, *k)));
+            map.remove_many(existing.iter());
+            assert!(map.is_empty(), "{n}");
+            assert_eq!(map.root_addr, NULL, "{n}: the root is still allocated");
+            assert_eq!(map.allocator.num_allocated_chunks(), 0, "{n}");
+        }
+    }
+}
+
+#[test]
+fn remove_many_of_runs_across_the_tree() {
+    // A tree several levels deep, with runs of every length taken from its start, middle
+    // and end: short runs underflow one leaf, long ones merge whole subtrees and shrink the
+    // tree from the top.
+    let n = 5_000u64;
+    let existing: Vec<u64> = (0..n).collect();
+    for len in [1u64, 4, 5, 6, 11, 50, 400, 2_500, n - 1] {
+        for start in [0, n / 3, n - len] {
+            let batch: Vec<u64> = (start..start + len).collect();
+            for cache_slots in [0, 16] {
+                assert_remove_many_matches(
+                    &existing,
+                    &batch,
+                    cache_slots,
+                    &format!("run of {len} from {start}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn remove_many_of_spread_out_keys() {
+    // Every k-th key thins every leaf at once, so each one underflows by a different
+    // amount and is rebalanced as the batch leaves it.
+    let existing: Vec<u64> = (0..5_000).collect();
+    for step in [2usize, 3, 5, 7, 13, 101] {
+        for offset in [0, 1] {
+            let batch: Vec<u64> = existing
+                .iter()
+                .copied()
+                .skip(offset)
+                .step_by(step)
+                .collect();
+            for cache_slots in [0, 16] {
+                assert_remove_many_matches(
+                    &existing,
+                    &batch,
+                    cache_slots,
+                    &format!("every {step}th from {offset}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn remove_many_skips_absent_and_repeated_keys() {
+    let existing: Vec<u64> = (0..1_000).map(|i| i * 2).collect();
+    let batch: Vec<u64> = (0..1_500).flat_map(|i| [i, i, i + 1]).collect();
+    assert_remove_many_matches(&existing, &batch, 16, "absent and repeated keys");
+}
+
+#[test]
+fn remove_many_handles_out_of_order_input() {
+    // `remove_many` is tuned for ascending keys, but wrong ordering must never corrupt the
+    // tree; it may only cost extra descents. These orderings make the path unwind
+    // constantly, including all the way back to the root.
+    let n = 1_500u64;
+    let existing: Vec<u64> = (0..n).collect();
+    let mut shuffled: Vec<u64> = existing.clone();
+    let mut next = xorshift(7);
+    for i in (1..shuffled.len()).rev() {
+        shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    let orderings: Vec<(&str, Vec<u64>)> = vec![
+        ("descending", (0..n).rev().collect()),
+        (
+            "zigzag",
+            (0..n)
+                .map(|i| if i % 2 == 0 { i / 2 } else { n - 1 - i / 2 })
+                .collect(),
+        ),
+        ("sawtooth", (0..n).map(|i| (i * 7) % n).collect()),
+        ("shuffled", shuffled),
+    ];
+
+    for (label, batch) in orderings {
+        for cache_slots in [0, 16] {
+            assert_remove_many_matches(&existing, &batch, cache_slots, label);
+            let half = &batch[..batch.len() / 2];
+            assert_remove_many_matches(&existing, half, cache_slots, &format!("{label}, half"));
+        }
+    }
+}
+
+#[test]
+fn remove_many_across_layouts() {
+    // The V1 node layout differs from V2, and `run_btree_test` covers V1,
+    // V1-migrated-to-V2 and V2. Bounded types, because it skips V1 for unbounded ones.
+    let n = 2_000u64;
+    let batches: Vec<(&str, Vec<u64>)> = vec![
+        ("everything", (0..n).collect()),
+        ("a run", (n / 4..n * 3 / 4).collect()),
+        ("every third", (0..n).step_by(3).collect()),
+        ("descending", (0..n).rev().step_by(2).collect()),
+    ];
+
+    for (label, batch) in batches {
+        run_btree_test::<u64, u64, _, _>(|mut actual| {
+            let mut expected = StdBTreeMap::new();
+            for key in 0..n {
+                actual.insert(key, key * 3);
+                expected.insert(key, key * 3);
+            }
+            for key in &batch {
+                expected.remove(key);
+            }
+            actual.remove_many(batch.iter());
+
+            assert_btree_invariants(&actual, label);
+            let actual_entries: Vec<(u64, u64)> =
+                actual.iter().map(|e| (*e.key(), e.value())).collect();
+            let expected_entries: Vec<(u64, u64)> = expected.into_iter().collect();
+            assert_eq!(actual_entries, expected_entries, "{label}");
+        });
+    }
+}
+
+#[test]
+fn remove_many_with_unbounded_values() {
+    // Values spanning V2 overflow pages, so that merging and rotating move entries whose
+    // bytes live on another node's pages.
+    let mut map: BTreeMap<u64, Vec<u8>, _> = BTreeMap::new(make_memory());
+    let mut expected = StdBTreeMap::new();
+    for i in 0..600u64 {
+        let value = vec![i as u8; (i as usize * 37) % 3_000];
+        map.insert(i, value.clone());
+        expected.insert(i, value);
+    }
+    let batch: Vec<u64> = (0..600).filter(|i| i % 4 != 1).collect();
+    for key in &batch {
+        expected.remove(key);
+    }
+    map.remove_many(batch);
+
+    assert_btree_invariants(&map, "unbounded values");
+    let actual: Vec<(u64, Vec<u8>)> = map.iter().map(|e| (*e.key(), e.value())).collect();
+    assert_eq!(actual, expected.into_iter().collect::<Vec<_>>());
+    for key in actual.iter().map(|(k, _)| *k).collect::<Vec<_>>() {
+        assert!(map.remove(&key).is_some());
+    }
+    assert_eq!(map.allocator.num_allocated_chunks(), 0);
+}
+
+#[test]
+fn remove_many_preserves_the_btree_invariants() {
+    // Batches of varying shape, interleaved with `insert_many`, `insert` and `remove`, so
+    // that trees reshaped by one are reshaped again by the others. The tree is walked
+    // after every step.
+    for seed in 0..12u64 {
+        let mut next = xorshift(seed);
+        let cache_slots = [0usize, 1, 16][(seed % 3) as usize];
+        let mut actual: BTreeMap<u64, u64, _> =
+            BTreeMap::new(make_memory()).with_node_cache(cache_slots);
+        let mut expected = StdBTreeMap::new();
+        actual.insert_many((0..3_000u64).map(|k| (k, k)));
+        expected.extend((0..3_000u64).map(|k| (k, k)));
+
+        for step in 0..30 {
+            let ctx = format!("seed {seed} step {step} cache {cache_slots}");
+            let base = next() % 4_000;
+            let span = 1 + next() % 2_500;
+
+            match next() % 8 {
+                0..=3 => {
+                    let len = 1 + next() % 600;
+                    let mut keys: Vec<u64> = (0..len).map(|_| base + next() % span).collect();
+                    match next() % 3 {
+                        0 => keys.sort_unstable(),
+                        1 => {
+                            keys.sort_unstable();
+                            keys.reverse();
+                        }
+                        _ => {}
+                    }
+                    for key in &keys {
+                        expected.remove(key);
+                    }
+                    actual.remove_many(keys);
+                }
+                4 => {
+                    let len = 1 + next() % 300;
+                    let keys: Vec<u64> = (0..len).map(|_| base + next() % span).collect();
+                    for key in &keys {
+                        expected.insert(*key, key.wrapping_mul(31));
+                    }
+                    actual.insert_many(keys.iter().map(|k| (*k, k.wrapping_mul(31))));
+                }
+                5 => {
+                    let key = base + next() % span;
+                    let value = next();
+                    assert_eq!(
+                        actual.insert(key, value),
+                        expected.insert(key, value),
+                        "{ctx}: insert {key}"
+                    );
+                }
+                6 => {
+                    let key = base + next() % span;
+                    assert_eq!(
+                        actual.remove(&key),
+                        expected.remove(&key),
+                        "{ctx}: remove {key}"
+                    );
+                }
+                _ => {
+                    let keys: Vec<u64> = expected.keys().copied().collect();
+                    for key in &keys {
+                        expected.remove(key);
+                    }
+                    actual.remove_many(keys);
+                }
+            }
+
+            assert_btree_invariants(&actual, &ctx);
+            assert_eq!(actual.len() as usize, expected.len(), "{ctx}: length");
+            assert_eq!(
+                collect_entry(actual.iter()),
+                expected.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
+                "{ctx}: contents"
+            );
+        }
+
+        let keys: Vec<u64> = expected.keys().copied().collect();
+        actual.remove_many(keys);
+        assert!(actual.is_empty(), "seed {seed}");
+        assert_eq!(
+            actual.allocator.num_allocated_chunks(),
+            0,
+            "seed {seed}: chunks left allocated"
+        );
+    }
+}

@@ -1654,4 +1654,121 @@ pub fn btreemap_v2_peek_then_pop_last_u64_u64_nocache() -> BenchResult {
     )
 }
 
+// Batch removal. Every `remove_many` benchmark has a `remove_loop` counterpart over exactly
+// the same map and keys, so the two are directly comparable.
+
+fn sequential_map(count: u64) -> BTreeMap<u64, u64, DefaultMemoryImpl> {
+    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
+    btree.insert_many((0..count).map(|i| (i, i)));
+    btree
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_remove_loop_seq_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(10_000);
+    bench_fn(|| {
+        for key in 0..10_000u64 {
+            btree.remove(&key);
+        }
+    })
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_remove_many_seq_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(10_000);
+    bench_fn(|| {
+        btree.remove_many(0..10_000u64);
+    })
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_remove_loop_desc_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(10_000);
+    bench_fn(|| {
+        for key in (0..10_000u64).rev() {
+            btree.remove(&key);
+        }
+    })
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_remove_many_desc_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(10_000);
+    bench_fn(|| {
+        btree.remove_many((0..10_000u64).rev());
+    })
+}
+
+// `remove_many` wants ascending keys, so a caller holding unordered keys sorts them first.
+// The sort is inside the measured section; the loop baseline is `btreemap_v2_remove_u64_u64`.
+#[bench(raw)]
+pub fn btreemap_v2_remove_many_sorted_random_u64_u64() -> BenchResult {
+    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
+    let mut rng = Rng::from_seed(0);
+    let items = generate_random_kv::<u64, u64>(10_000, &mut rng);
+    for (k, v) in items.clone() {
+        btree.insert(k, v);
+    }
+    let keys: Vec<u64> = items.into_iter().map(|(k, _)| k).collect();
+    bench_fn(|| {
+        let mut keys = keys;
+        keys.sort_unstable();
+        btree.remove_many(keys);
+    })
+}
+
+// Unordered keys forfeit the coalescing, so this should land close to the plain loop.
+#[bench(raw)]
+pub fn btreemap_v2_remove_many_unsorted_u64_u64() -> BenchResult {
+    let mut btree = BTreeMap::new(DefaultMemoryImpl::default());
+    let mut rng = Rng::from_seed(0);
+    let items = generate_random_kv::<u64, u64>(10_000, &mut rng);
+    for (k, v) in items.clone() {
+        btree.insert(k, v);
+    }
+    let keys: Vec<u64> = items.into_iter().map(|(k, _)| k).collect();
+    bench_fn(|| {
+        btree.remove_many(keys);
+    })
+}
+
+// A run of 10k keys out of the middle of a 100k map, as when every row of one prefix goes.
+#[bench(raw)]
+pub fn btreemap_v2_remove_loop_run_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(100_000);
+    bench_fn(|| {
+        for key in 45_000..55_000u64 {
+            btree.remove(&key);
+        }
+    })
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_remove_many_run_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(100_000);
+    bench_fn(|| {
+        btree.remove_many(45_000..55_000u64);
+    })
+}
+
+// Every tenth key of a 100k map: each leaf loses an entry or two, so most of them stay above
+// the minimum and only need writing once.
+#[bench(raw)]
+pub fn btreemap_v2_remove_loop_spread_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(100_000);
+    bench_fn(|| {
+        for key in (0..100_000u64).step_by(10) {
+            btree.remove(&key);
+        }
+    })
+}
+
+#[bench(raw)]
+pub fn btreemap_v2_remove_many_spread_u64_u64() -> BenchResult {
+    let mut btree = sequential_map(100_000);
+    bench_fn(|| {
+        btree.remove_many((0..100_000u64).step_by(10));
+    })
+}
+
 fn main() {}

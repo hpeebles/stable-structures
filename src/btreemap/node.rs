@@ -371,6 +371,44 @@ impl<K: Storable + Ord + Clone> Node<K> {
         source.deallocate(allocator);
     }
 
+    /// Merges `sibling`, and the `separator` that sits between the two in their parent,
+    /// into self, and returns the emptied sibling for the caller to deallocate.
+    ///
+    /// Unlike [`Node::merge`], either node may be empty, since a batched removal can drain
+    /// a node completely before it rebalances it, and so the caller says which side the
+    /// sibling is on rather than it being worked out from the keys. Nothing is saved.
+    ///
+    /// PRECONDITION:
+    ///   * `self` and `sibling` are of the same node type.
+    ///   * `sibling` and `self` are adjacent children of one parent, `separator` between them.
+    pub fn absorb<M: Memory>(
+        &mut self,
+        mut sibling: Node<K>,
+        separator: Entry<K>,
+        sibling_is_left: bool,
+        memory: &M,
+    ) -> Node<K> {
+        debug_assert_eq!(self.node_type(), sibling.node_type());
+        // Load the sibling's entries first: they are about to leave the page they are
+        // lazily read from.
+        for i in 0..sibling.entries_len() {
+            sibling.entry(i, memory);
+        }
+
+        if sibling_is_left {
+            sibling.push_entry(separator);
+            sibling.entries.append(&mut self.entries);
+            sibling.children.append(&mut self.children);
+            self.entries = core::mem::take(&mut sibling.entries);
+            self.children = core::mem::take(&mut sibling.children);
+        } else {
+            self.push_entry(separator);
+            self.entries.append(&mut sibling.entries);
+            self.children.append(&mut sibling.children);
+        }
+        sibling
+    }
+
     /// Appends the entries and children of node `b` into `a`, along with the median entry.
     ///
     /// PRECONDITION:
