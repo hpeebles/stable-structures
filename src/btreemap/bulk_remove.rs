@@ -3,6 +3,7 @@
 //! [`BTreeMap::remove_many`] removes a stream of keys while holding the current
 //! root-to-leaf path in memory, as [`BTreeMap::insert_many`] does, so that each modified
 //! node is written to stable memory once the batch moves past it rather than once per key.
+//! The held path is a [`Batch`], and this module is what a batch does to remove.
 //!
 //! # Underflow
 //!
@@ -45,58 +46,22 @@
 //!
 //! # Attributing the cost
 //!
-//! Building with the `bench_scope` feature splits a batch into three canbench scopes:
+//! Building with the `bench_scope` feature adds one canbench scope to the ones every batch
+//! has, which are listed with [`Batch`]:
 //!
-//! - `bulk_remove_release` — a node leaving the path: written out if dirty, else returned
-//!   to the node cache
 //! - `bulk_remove_rebalance` — bringing one node back up to the minimum
-//! - `bulk_remove_descend` — taking one child out of the cache and recording its bounds
 
-use crate::btreemap::node::{Node, NodeType, B};
-use crate::btreemap::path::{PathLevel, Position};
+use crate::btreemap::node::{Node, NodeType};
+use crate::btreemap::path::{Batch, Position, Side, MIN_ENTRIES};
 use crate::types::NULL;
 use crate::{BTreeMap, Memory, Storable};
 
-/// The fewest entries a node other than the root may hold.
-const MIN_ENTRIES: usize = B - 1;
-
-/// Removes a stream of keys while keeping the current root-to-leaf path in memory, so that
-/// each modified node is written to stable memory once the batch moves past it rather
-/// than once per key.
-///
-/// Dropping a `BulkRemove` puts right and writes back whatever it is still holding: the
-/// remaining path, and the header if `length` or `root_addr` moved. That is how a batch is
-/// completed, so the drop is load-bearing on every call.
-pub(super) struct BulkRemove<'a, K, V, M>
+impl<K, V, M> Batch<'_, K, V, M>
 where
     K: Storable + Ord + Clone,
     V: Storable,
     M: Memory,
 {
-    map: &'a mut BTreeMap<K, V, M>,
-
-    /// Root first, leaf last. Empty before the first removal, and whenever the root has
-    /// just been replaced.
-    path: Vec<PathLevel<K>>,
-
-    /// Whether `length` or `root_addr` changed and the header still needs writing.
-    header_dirty: bool,
-}
-
-impl<'a, K, V, M> BulkRemove<'a, K, V, M>
-where
-    K: Storable + Ord + Clone,
-    V: Storable,
-    M: Memory,
-{
-    pub(super) fn new(map: &'a mut BTreeMap<K, V, M>) -> Self {
-        Self {
-            map,
-            path: Vec::new(),
-            header_dirty: false,
-        }
-    }
-
     pub(super) fn remove(&mut self, key: &K) {
         // Drop back up the path until we reach a node that still covers this key.
         while let Some(bottom) = self.path.last() {
@@ -291,76 +256,6 @@ where
         }
     }
 
-    /// Starts a fresh path at the root.
-    fn push_root(&mut self) {
-        let node = self.map.take_or_load_node(self.map.root_addr);
-        self.path.push(PathLevel {
-            node,
-            index_in_parent: 0,
-            lower: None,
-            upper: None,
-            depth: 0,
-            dirty: false,
-        });
-    }
-
-    /// Descends one level, into the child at `idx` of the node currently at the bottom.
-    fn push_child(&mut self, idx: usize) {
-        #[cfg(feature = "bench_scope")]
-        let _p = canbench_rs::bench_scope("bulk_remove_descend"); // May add significant overhead.
-
-        let (address, lower, upper, depth) = {
-            let bottom = self.path.last().expect("only called while descending");
-            let (lower, upper) = bottom.child_bounds(idx, self.map.memory());
-            (
-                bottom.node.child(idx),
-                lower,
-                upper,
-                bottom.depth.saturating_add(1),
-            )
-        };
-        let node = self.map.take_or_load_node(address);
-        self.path.push(PathLevel {
-            node,
-            index_in_parent: idx,
-            lower,
-            upper,
-            depth,
-            dirty: false,
-        });
-    }
-
-    /// Releases a node that has left the path: written out if modified, handed back to the
-    /// node cache otherwise.
-    ///
-    /// The only node that leaves the path empty is the root, which has no minimum. An empty
-    /// root is dropped instead: an empty leaf leaves the map empty, and an internal root
-    /// left with no entries hands the root over to its only child.
-    fn release(&mut self, level: PathLevel<K>) {
-        #[cfg(feature = "bench_scope")]
-        let _p = canbench_rs::bench_scope("bulk_remove_release"); // May add significant overhead.
-
-        let mut node = level.node;
-        debug_assert!(
-            self.path.is_empty() || node.entries_len() >= MIN_ENTRIES,
-            "only the root may leave the path under the minimum"
-        );
-
-        if node.entries_len() == 0 {
-            assert!(self.path.is_empty(), "only the root may be empty");
-            self.map.root_addr = match node.node_type() {
-                NodeType::Leaf => NULL,
-                NodeType::Internal => node.child(0),
-            };
-            self.map.deallocate_node(node);
-            self.header_dirty = true;
-        } else if level.dirty {
-            self.map.save_node(&mut node);
-        } else {
-            self.map.return_node(node, level.depth);
-        }
-    }
-
     /// Puts right the node at the bottom of the path if it is under the minimum, keeping it
     /// on the path, and then every node above it that the fix took under the minimum in
     /// turn. A root left with no entries is dropped, if its only child is still held.
@@ -368,7 +263,7 @@ where
     /// Each node is filled from the sibling on the `toward` side, if it has one. That is
     /// the side the batch is heading to, so what the node takes in is what the batch wants
     /// next, and the node goes on serving it instead of being written and read back.
-    fn fix_path(&mut self, toward: Side) {
+    pub(super) fn fix_path(&mut self, toward: Side) {
         let mut level = self.path.len().saturating_sub(1);
         while level > 0 && self.path[level].node.entries_len() < MIN_ENTRIES {
             let (above, rest) = self.path.split_at_mut(level);
@@ -485,91 +380,6 @@ where
     }
 }
 
-#[cfg(test)]
-impl<K, V, M> BulkRemove<'_, K, V, M>
-where
-    K: Storable + Ord + Clone,
-    V: Storable,
-    M: Memory,
-{
-    /// Checks everything the batch relies on between two keys: the path runs from the
-    /// root down through each level's recorded child slot, every level's bounds are the
-    /// separators either side of that slot, and nothing but a leaf at the bottom is below
-    /// the minimum. Called after every key under test, so that a slip in the bookkeeping
-    /// is caught where it happens rather than as a damaged tree several keys later.
-    pub(super) fn assert_path_invariants(&self) {
-        use crate::btreemap::node::CAPACITY;
-
-        let memory = self.map.memory();
-        for (i, level) in self.path.iter().enumerate() {
-            let node = &level.node;
-            let len = node.entries_len();
-            assert_eq!(level.depth as usize, i, "depth of level {i}");
-
-            if i == 0 {
-                assert_eq!(
-                    node.address(),
-                    self.map.root_addr,
-                    "the path starts at the root"
-                );
-                assert!(level.lower.is_none() && level.upper.is_none());
-                assert_eq!(level.index_in_parent, 0);
-            } else {
-                let parent = &self.path[i - 1];
-                assert_eq!(
-                    parent.node.child(level.index_in_parent),
-                    node.address(),
-                    "level {i} is not at its recorded slot in its parent"
-                );
-                let (lower, upper) = parent.child_bounds(level.index_in_parent, memory);
-                assert!(
-                    lower == level.lower && upper == level.upper,
-                    "the bounds of level {i} are not the separators around it"
-                );
-            }
-
-            assert!(len <= CAPACITY, "level {i} is over capacity");
-            match node.node_type() {
-                NodeType::Internal => {
-                    assert_eq!(node.children_len(), len + 1, "children of level {i}");
-                    let minimum = if i == 0 { 1 } else { MIN_ENTRIES };
-                    assert!(
-                        len >= minimum,
-                        "internal level {i} holds only {len} entries"
-                    );
-                }
-                NodeType::Leaf => {
-                    assert_eq!(
-                        i + 1,
-                        self.path.len(),
-                        "a leaf above the bottom of the path"
-                    );
-                    assert_eq!(node.children_len(), 0);
-                }
-            }
-
-            for j in 0..len {
-                let key = node.key(j, memory);
-                assert!(
-                    level.covers(key),
-                    "a key of level {i} is outside its bounds"
-                );
-                assert!(
-                    j == 0 || node.key(j - 1, memory) < key,
-                    "keys of level {i} unsorted"
-                );
-            }
-        }
-    }
-}
-
-/// One side of the path: that of the smaller keys, or that of the larger.
-#[derive(Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-}
-
 /// What a rebalance did to the position of `node`'s children.
 struct Moved {
     /// The left sibling was merged in, so `node` now sits one place further left in its
@@ -577,21 +387,4 @@ struct Moved {
     merged_left: bool,
     /// How many children were put in front of `node`'s own, shifting each of them right.
     prepended: usize,
-}
-
-impl<K, V, M> Drop for BulkRemove<'_, K, V, M>
-where
-    K: Storable + Ord + Clone,
-    V: Storable,
-    M: Memory,
-{
-    fn drop(&mut self) {
-        self.fix_path(Side::Right);
-        while let Some(level) = self.path.pop() {
-            self.release(level);
-        }
-        if self.header_dirty {
-            self.map.save_header();
-        }
-    }
 }

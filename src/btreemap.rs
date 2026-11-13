@@ -63,12 +63,11 @@ use crate::{
     Memory, Storable,
 };
 use allocator::Allocator;
-use bulk_insert::BulkInsert;
-use bulk_remove::BulkRemove;
 pub use iter::Iter;
 use node::{DerivedPageSize, Node, NodeType, PageSize, Version, MINIMUM_PAGE_SIZE};
 use node_cache::NodeCache;
 pub use node_cache::NodeCacheMetrics;
+use path::Batch;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -1058,11 +1057,13 @@ where
     /// assert_eq!(map.get(&500), Some(1_000));
     /// ```
     pub fn insert_many(&mut self, entries: impl IntoIterator<Item = (K, V)>) {
-        let mut bulk = BulkInsert::new(self);
+        let mut batch = Batch::new(self);
         for (key, value) in entries {
-            bulk.insert(key, value);
+            batch.insert(key, value);
+            #[cfg(test)]
+            batch.assert_invariants();
         }
-        // Dropping `bulk` here writes out the path it is still holding, along with the
+        // Dropping `batch` here writes out the path it is still holding, along with the
         // header. That is what completes the batch.
     }
 
@@ -1404,13 +1405,13 @@ where
     /// assert_eq!(map.get(&3), Some(6));
     /// ```
     pub fn remove_many<Q: std::borrow::Borrow<K>>(&mut self, keys: impl IntoIterator<Item = Q>) {
-        let mut bulk = BulkRemove::new(self);
+        let mut batch = Batch::new(self);
         for key in keys {
-            bulk.remove(key.borrow());
+            batch.remove(key.borrow());
             #[cfg(test)]
-            bulk.assert_path_invariants();
+            batch.assert_invariants();
         }
-        // Dropping `bulk` here puts right and writes out the path it is still holding,
+        // Dropping `batch` here puts right and writes out the path it is still holding,
         // along with the header. That is what completes the batch.
     }
 
