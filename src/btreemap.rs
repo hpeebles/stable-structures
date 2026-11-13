@@ -1366,7 +1366,8 @@ where
     /// the current root-to-leaf path in memory, lets the leaf it is removing from fall below
     /// the minimum while it is held, and puts it right once, as the input moves past it. A
     /// modified node is saved only then, and the header once for the whole call rather than
-    /// once per key.
+    /// once per key. A leaf that the batch empties is not written at all, and the values
+    /// removed are never read.
     ///
     /// The iterator is consumed lazily and never collected, so the memory cost is one tree
     /// path however many keys are supplied. Keys that are not in the map are skipped, as
@@ -1379,9 +1380,8 @@ where
     /// # Supply keys in sorted order for best performance
     ///
     /// The coalescing pays off exactly when consecutive keys land in the same node, so
-    /// **feed the keys in sorted order**, ascending for best results: a key that sits in an
-    /// internal node is replaced by its successor, which takes the path down the subtree
-    /// an ascending batch visits next.
+    /// **feed the keys in sorted order**. Ascending and descending do equally well: the
+    /// held path unwinds leftwards as readily as rightwards.
     ///
     /// Out-of-order keys are still handled correctly — the path unwinds to an ancestor that
     /// covers the key, as far as the root if necessary — but each one costs a fresh

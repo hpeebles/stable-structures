@@ -31,7 +31,43 @@ pub(super) struct PathLevel<K: Storable + Ord + Clone> {
     pub(super) dirty: bool,
 }
 
+/// Where a key falls relative to the keys a node on the path is responsible for.
+pub(super) enum Position {
+    /// Under another node, further left.
+    Before,
+    /// The separator the node takes its lower bound from, which an ancestor holds.
+    AtLower,
+    /// Somewhere under the node.
+    Within,
+    /// The separator the node takes its upper bound from, which an ancestor holds.
+    AtUpper,
+    /// Under another node, further right.
+    After,
+}
+
 impl<K: Storable + Ord + Clone> PathLevel<K> {
+    /// Where `key` falls relative to this node's bounds. [`PathLevel::covers`] says only
+    /// whether it is within them.
+    pub(super) fn position(&self, key: &K) -> Position {
+        use core::cmp::Ordering;
+
+        if let Some(lower) = &self.lower {
+            match key.cmp(lower) {
+                Ordering::Less => return Position::Before,
+                Ordering::Equal => return Position::AtLower,
+                Ordering::Greater => {}
+            }
+        }
+        if let Some(upper) = &self.upper {
+            match key.cmp(upper) {
+                Ordering::Greater => return Position::After,
+                Ordering::Equal => return Position::AtUpper,
+                Ordering::Less => {}
+            }
+        }
+        Position::Within
+    }
+
     /// Whether `key` belongs somewhere under this node.
     ///
     /// For an ascending batch only the upper bound can ever fail, and that is the case this

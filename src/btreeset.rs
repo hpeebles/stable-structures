@@ -447,9 +447,9 @@ where
     /// Removes many keys, writing each modified node to stable memory at most once instead
     /// of once per key. See [`BTreeMap::remove_many`] for the details.
     ///
-    /// Supply the keys in sorted order, ascending for best results, for the coalescing to
-    /// pay off. Out-of-order keys are handled correctly but forfeit the speedup. Keys not in
-    /// the set are skipped.
+    /// Supply the keys in sorted order, ascending or descending, for the coalescing to pay
+    /// off. Out-of-order keys are handled correctly but forfeit the speedup. Keys not in the
+    /// set are skipped.
     ///
     /// The iterator is consumed lazily and never collected.
     ///

@@ -4076,6 +4076,94 @@ fn remove_many_preserves_the_btree_invariants() {
     }
 }
 
+/// A memory that counts the nodes saved to it. Every save starts by writing the node's
+/// header, which begins with the node magic.
+#[derive(Clone)]
+struct SaveCountingMemory {
+    inner: Rc<RefCell<Vec<u8>>>,
+    saves: Rc<std::cell::Cell<u64>>,
+}
+
+impl Memory for SaveCountingMemory {
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn grow(&self, pages: u64) -> i64 {
+        self.inner.grow(pages)
+    }
+
+    fn read(&self, offset: u64, dst: &mut [u8]) {
+        self.inner.read(offset, dst)
+    }
+
+    fn write(&self, offset: u64, src: &[u8]) {
+        if src.starts_with(b"BTN") {
+            self.saves.set(self.saves.get() + 1);
+        }
+        self.inner.write(offset, src)
+    }
+}
+
+/// The number of nodes `remove_many` saves in taking `batch` out of a map of the keys
+/// `0..n`, built in key order, which leaves every leaf but the last at the minimum of five
+/// entries.
+fn nodes_saved_by_remove_many(n: u64, batch: impl IntoIterator<Item = u64>) -> u64 {
+    let saves = Rc::new(std::cell::Cell::new(0));
+    let memory = SaveCountingMemory {
+        inner: make_memory(),
+        saves: saves.clone(),
+    };
+    let mut map: BTreeMap<u64, u64, _> = BTreeMap::new(memory);
+    map.insert_many((0..n).map(|k| (k, k)));
+
+    saves.set(0);
+    let batch: Vec<u64> = batch.into_iter().collect();
+    map.remove_many(&batch);
+
+    assert_btree_invariants(&map, "after the batch");
+    let removed: BTreeSet<u64> = batch.into_iter().collect();
+    assert_eq!(
+        collect_entry(map.iter()),
+        (0..n)
+            .filter(|k| !removed.contains(k))
+            .map(|k| (k, k))
+            .collect::<Vec<_>>()
+    );
+    saves.get()
+}
+
+#[test]
+fn remove_many_of_a_run_does_not_write_the_leaves_it_empties() {
+    // 6,000 consecutive keys take about a thousand whole leaves with them, along with the
+    // separators between those. A leaf the run empties is deallocated without being
+    // written, and a separator is removed without its leaf leaving the path, so what is
+    // left to save is the leaf at either end of the run and the internal nodes above it.
+    // Looking each separator up from the top instead costs a save per key.
+    let ascending = nodes_saved_by_remove_many(20_000, 5_000..11_000);
+    assert!(ascending <= 60, "ascending: {ascending} nodes saved");
+    let descending = nodes_saved_by_remove_many(20_000, (5_000..11_000).rev());
+    assert!(descending <= 60, "descending: {descending} nodes saved");
+
+    // With every key gone there is next to nothing left to save at all.
+    let everything = nodes_saved_by_remove_many(20_000, 0..20_000);
+    assert!(everything <= 20, "everything: {everything} nodes saved");
+}
+
+#[test]
+fn remove_many_writes_a_leaf_that_keeps_underflowing_once() {
+    // Seven keys out of every eight: every leaf is left with an entry or none, and has to
+    // be filled from the next one, which the batch then all but empties in turn. The leaf
+    // stays on the path while it takes its neighbours in, so it is saved once, when
+    // enough has gathered in it to stay. The 2,500 entries left need at least 228 leaves;
+    // saving each leaf every time it is filled costs several thousand.
+    let n = 20_000u64;
+    let ascending = nodes_saved_by_remove_many(n, (0..n).filter(|k| k % 8 != 0));
+    assert!(ascending <= 1_000, "ascending: {ascending} nodes saved");
+    let descending = nodes_saved_by_remove_many(n, (0..n).rev().filter(|k| k % 8 != 0));
+    assert!(descending <= 1_000, "descending: {descending} nodes saved");
+}
+
 /// One randomized run of `remove_many` against a model, for one key and value type.
 ///
 /// Every batch is followed by a walk of the tree as it is stored, a comparison of its

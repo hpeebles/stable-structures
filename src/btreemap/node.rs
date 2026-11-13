@@ -144,6 +144,13 @@ impl<K: Storable + Ord + Clone> Node<K> {
         )
     }
 
+    /// Replaces the entry at `idx`, discarding the old one without reading it.
+    ///
+    /// Prefer this to [`Node::swap_entry`] when the previous entry is not needed.
+    pub fn set_entry(&mut self, idx: usize, (key, value): Entry<K>) {
+        self.entries[idx] = (LazyKey::by_value(key), LazyValue::by_value(value));
+    }
+
     /// Returns a reference to the entry at the specified index.
     #[inline(always)]
     pub fn entry<M: Memory>(&self, idx: usize, memory: &M) -> EntryRef<'_, K> {
@@ -308,6 +315,13 @@ impl<K: Storable + Ord + Clone> Node<K> {
             self.extract_key(key, memory),
             self.extract_value(value, memory),
         )
+    }
+
+    /// Removes the entry at the specified index, discarding it without reading it.
+    ///
+    /// Prefer this to [`Node::remove_entry`] when the removed entry is not needed.
+    pub fn discard_entry(&mut self, idx: usize) {
+        self.entries.remove(idx);
     }
 
     /// Adds a new entry at the back of the node.

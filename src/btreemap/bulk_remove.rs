@@ -12,26 +12,48 @@
 //! rebalancing after each one would write the leaf's siblings over and over.
 //!
 //! Instead the leaf at the bottom of the path is allowed to fall below the minimum, even to
-//! empty, while it is held. It is put right once, when it leaves the path, by taking
-//! entries from a sibling or merging with one through the parent, which is still held.
+//! empty, while it is held. It is put right once, when the batch is about to leave it, by
+//! taking entries from a sibling or merging with one through the parent, which is held too.
 //! Taking an entry out of the parent can leave it under the minimum in turn, so the fix
-//! cascades up the path, but only internal nodes, all of them still held, are fixed that
-//! way, and they are fixed straight away. So every node off the path, and every internal
-//! node on it, is always a valid B-tree node; only the held leaf may not be.
+//! cascades up the path, but internal nodes are fixed straight away. So every node off the
+//! path, and every internal node on it, is always a valid B-tree node; only the held leaf
+//! may not be.
 //!
 //! The node kept by a rebalance is always the one being fixed, with the sibling merged
-//! into it or lending it entries, so the path never has to switch to a different node.
+//! into it or lending it entries, so the path never has to switch to a different node. The
+//! sibling is the one on the side the batch is heading to, where there is one. What comes
+//! over from it is then what the batch wants next, and since the leaf is still on the path
+//! it goes on serving the batch: a leaf that keeps underflowing swallows its neighbours
+//! one after another and is written once, when the batch finally moves beyond it.
+//!
+//! # Separators
+//!
+//! A key held by an internal node is replaced by its neighbour in key order, taken from a
+//! leaf. Two cases are worth more than that, and both come up once per leaf when a run of
+//! consecutive keys is removed.
+//!
+//! The key may be one of the two separators either side of the path, which the bounds of
+//! the bottom of the path are copies of. Its neighbour is then at the near end of the held
+//! leaf, and is moved up without leaving the path. Otherwise the leaf would be released
+//! and written, the separator found from higher up, and the leaf read back to supply the
+//! neighbour: once for every key of the run, since each neighbour moved up is the next key
+//! to go.
+//!
+//! And the held leaf may have been emptied already. It has to go, and removing a child
+//! takes one entry out of its parent with it, so the leaf and the separator go together,
+//! and no sibling is read or written for either.
 //!
 //! # Attributing the cost
 //!
 //! Building with the `bench_scope` feature splits a batch into three canbench scopes:
 //!
-//! - `bulk_remove_release` — a node leaving the path, including fixing an underflow
-//! - `bulk_remove_rebalance` — the underflow fix, nested inside the previous one
+//! - `bulk_remove_release` — a node leaving the path: written out if dirty, else returned
+//!   to the node cache
+//! - `bulk_remove_rebalance` — bringing one node back up to the minimum
 //! - `bulk_remove_descend` — taking one child out of the cache and recording its bounds
 
 use crate::btreemap::node::{Node, NodeType, B};
-use crate::btreemap::path::PathLevel;
+use crate::btreemap::path::{PathLevel, Position};
 use crate::types::NULL;
 use crate::{BTreeMap, Memory, Storable};
 
@@ -77,7 +99,23 @@ where
 
     pub(super) fn remove(&mut self, key: &K) {
         // Drop back up the path until we reach a node that still covers this key.
-        while self.path.last().is_some_and(|level| !level.covers(key)) {
+        while let Some(bottom) = self.path.last() {
+            let toward = match bottom.position(key) {
+                Position::Within => break,
+                // A separator this node takes a bound from can be removed from where the
+                // path already is.
+                Position::AtLower => return self.remove_adjacent_separator(Side::Left),
+                Position::AtUpper => return self.remove_adjacent_separator(Side::Right),
+                Position::Before => Side::Left,
+                Position::After => Side::Right,
+            };
+            if self.path.len() > 1 && bottom.node.entries_len() < MIN_ENTRIES {
+                // The leaf has to be put right before it leaves the path. Taking from the
+                // sibling the key lies towards often brings the key under the leaf, so
+                // the bounds are looked at again before anything is released.
+                self.fix_path(toward);
+                continue;
+            }
             let level = self.path.pop().expect("just checked that one exists");
             self.release(level);
         }
@@ -95,7 +133,7 @@ where
             match (bottom.node.node_type(), search) {
                 (NodeType::Leaf, Ok(idx)) => {
                     let leaf = self.path.last_mut().expect("checked above");
-                    leaf.node.remove_entry(idx, self.map.memory());
+                    leaf.node.discard_entry(idx);
                     leaf.dirty = true;
                     self.removed_one();
                     return;
@@ -117,34 +155,140 @@ where
 
     /// Removes the entry at `idx` of the internal node at the bottom of the path by
     /// replacing it with its successor, the first entry of the leftmost leaf of the subtree
-    /// to its right. The path descends to that leaf, which is where an ascending batch goes
-    /// next, and the leaf is left to underflow if it must, like any other held leaf.
+    /// to its right. The path descends to that leaf, and the leaf is left to underflow if
+    /// it must, like any other held leaf.
     fn remove_from_internal(&mut self, idx: usize) {
-        let internal = self.path.len() - 1;
+        let holder = self.path.len() - 1;
         self.push_child(idx + 1);
-        while self.path.last().expect("just pushed").node.node_type() == NodeType::Internal {
-            self.push_child(0);
-        }
+        self.replace_with_neighbour(holder, idx, Side::Left);
+    }
 
-        let successor = {
-            let leaf = self.path.last_mut().expect("just pushed");
-            leaf.dirty = true;
-            leaf.node.remove_entry(0, self.map.memory())
+    /// Removes the separator on `side` of the bottom of the path, the entry of an ancestor
+    /// that the bottom takes its bound on that side from, without leaving the path.
+    ///
+    /// The separator is held by the parent of the deepest level that has a sibling on that
+    /// side: every level below that one is an outermost child, and inherited the bound
+    /// unchanged. So the path already runs down the edge of the subtree beside the
+    /// separator, which is where the separator's neighbour in key order is.
+    fn remove_adjacent_separator(&mut self, side: Side) {
+        let turn = (1..self.path.len())
+            .rev()
+            .find(|&i| match side {
+                Side::Left => self.path[i].index_in_parent > 0,
+                Side::Right => {
+                    self.path[i].index_in_parent + 1 < self.path[i - 1].node.children_len()
+                }
+            })
+            .expect("a bound is a separator held by an ancestor");
+        let idx = match side {
+            Side::Left => self.path[turn].index_in_parent - 1,
+            Side::Right => self.path[turn].index_in_parent,
         };
-        let successor_key = successor.0.clone();
+        self.replace_with_neighbour(turn - 1, idx, side);
+    }
 
-        let level = &mut self.path[internal];
-        level.node.swap_entry(idx, successor, self.map.memory());
-        level.dirty = true;
-
-        // The levels just pushed took the removed key as their lower bound, and it has
-        // been replaced by the successor. Left as it was, a later removal of the
-        // successor would be looked for in the leaf, which no longer holds it.
-        for level in &mut self.path[internal + 1..] {
-            level.lower = Some(successor_key.clone());
+    /// Removes the entry at `idx` of the internal node at `path[holder]` by putting its
+    /// neighbour in key order in its place: its successor if the entry is on the left of
+    /// the path below the holder, its predecessor if it is on the right.
+    ///
+    /// The path must already lead from the holder into the child beside the entry and from
+    /// there through outermost children only, back towards the entry, though it need not
+    /// have reached a leaf yet.
+    fn replace_with_neighbour(&mut self, holder: usize, idx: usize, side: Side) {
+        loop {
+            let bottom = self.path.last().expect("the holder");
+            if bottom.node.node_type() == NodeType::Leaf {
+                break;
+            }
+            let edge = match side {
+                Side::Left => 0,
+                Side::Right => bottom.node.children_len() - 1,
+            };
+            self.push_child(edge);
         }
 
+        let leaf = self.path.last_mut().expect("just reached");
+        if leaf.node.entries_len() > 0 {
+            leaf.dirty = true;
+            let neighbour = match side {
+                Side::Left => leaf.node.remove_entry(0, self.map.memory()),
+                Side::Right => leaf
+                    .node
+                    .pop_entry(self.map.memory())
+                    .expect("checked above"),
+            };
+            self.set_separator(holder, idx, neighbour, side);
+        } else {
+            self.drop_drained_leaf(holder, idx, side);
+        }
         self.removed_one();
+    }
+
+    /// Puts `entry` in place of the entry at `idx` of the internal node at `path[holder]`,
+    /// which is on `side` of the path below it. The entry it replaces is discarded.
+    ///
+    /// The levels below took the replaced key as their bound on that side, so they take
+    /// the new one. Left as it was, a later removal of `entry`'s key would be looked for
+    /// in the leaf, which no longer holds it.
+    fn set_separator(&mut self, holder: usize, idx: usize, entry: (K, Vec<u8>), side: Side) {
+        for level in &mut self.path[holder + 1..] {
+            let bound = match side {
+                Side::Left => &mut level.lower,
+                Side::Right => &mut level.upper,
+            };
+            *bound = Some(entry.0.clone());
+        }
+        let level = &mut self.path[holder];
+        level.node.set_entry(idx, entry);
+        level.dirty = true;
+    }
+
+    /// Removes the entry at `idx` of the internal node at `path[holder]` when the leaf its
+    /// neighbour was looked for in, at the bottom of the path, has already been emptied by
+    /// the batch.
+    ///
+    /// The leaf has to go in any case, and removing a child takes an entry out of its
+    /// parent with it. If the parent is the holder, that entry is the one being removed,
+    /// right beside the leaf. Otherwise the leaf is an outermost child of its parent, and
+    /// the parent's entry beside it, which is then the neighbour, moves up to the holder.
+    /// Either way no sibling is read or written.
+    fn drop_drained_leaf(&mut self, holder: usize, idx: usize, side: Side) {
+        let leaf = self.path.pop().expect("the leaf was just reached");
+        let parent = self.path.len() - 1;
+        let level = &mut self.path[parent];
+        debug_assert_eq!(
+            leaf.index_in_parent,
+            match (parent == holder, side) {
+                (true, Side::Left) => idx + 1,
+                (true, Side::Right) => idx,
+                (false, Side::Left) => 0,
+                (false, Side::Right) => level.node.children_len() - 1,
+            },
+            "the leaf is not where the entry's neighbour would be"
+        );
+        level.node.remove_child(leaf.index_in_parent);
+        level.dirty = true;
+        if parent == holder {
+            level.node.discard_entry(idx);
+        } else {
+            let neighbour = match side {
+                Side::Left => level.node.remove_entry(0, self.map.memory()),
+                Side::Right => level
+                    .node
+                    .pop_entry(self.map.memory())
+                    .expect("an internal node below the root holds entries"),
+            };
+            self.set_separator(holder, idx, neighbour, side);
+        }
+        self.map.deallocate_node(leaf.node);
+
+        // The parent is an entry down, which may have taken it under the minimum.
+        self.fix_path(side);
+        if self.path.len() == 1 && self.path[0].node.entries_len() == 0 {
+            // It was the root, and that was its last entry: its other child is the root.
+            let root = self.path.pop().expect("checked above");
+            self.release(root);
+        }
     }
 
     /// Starts a fresh path at the root.
@@ -186,77 +330,46 @@ where
         });
     }
 
-    /// Releases a node that has left the path. A node under the minimum is first put right
-    /// through its parent, which is now the bottom of the path; the root has no minimum,
-    /// and is dropped once it is empty. The node is then written out if modified, and
-    /// handed back to the node cache otherwise.
+    /// Releases a node that has left the path: written out if modified, handed back to the
+    /// node cache otherwise.
+    ///
+    /// The only node that leaves the path empty is the root, which has no minimum. An empty
+    /// root is dropped instead: an empty leaf leaves the map empty, and an internal root
+    /// left with no entries hands the root over to its only child.
     fn release(&mut self, level: PathLevel<K>) {
         #[cfg(feature = "bench_scope")]
         let _p = canbench_rs::bench_scope("bulk_remove_release"); // May add significant overhead.
 
-        let PathLevel {
-            mut node,
-            index_in_parent,
-            depth,
-            dirty,
-            ..
-        } = level;
+        let mut node = level.node;
+        debug_assert!(
+            self.path.is_empty() || node.entries_len() >= MIN_ENTRIES,
+            "only the root may leave the path under the minimum"
+        );
 
-        if self.path.is_empty() {
-            self.release_root(node, dirty, depth);
-            return;
-        }
-
-        if node.entries_len() >= MIN_ENTRIES {
-            if dirty {
-                self.map.save_node(&mut node);
-            } else {
-                self.map.return_node(node, depth);
-            }
-            return;
-        }
-
-        let parent = self.path.last_mut().expect("checked above");
-        Self::rebalance(self.map, &mut node, index_in_parent, &mut parent.node);
-        parent.dirty = true;
-        self.map.save_node(&mut node);
-        self.fix_path();
-
-        // The rebalance may have left the root with no entries, and the released node as
-        // its only child. The released node is then the root.
-        if self.path.len() == 1 && self.path[0].node.entries_len() == 0 {
-            let root = self.path.pop().expect("checked above");
-            debug_assert_eq!(root.node.child(0), node.address());
-            self.map.root_addr = node.address();
-            self.map.deallocate_node(root.node);
+        if node.entries_len() == 0 {
+            assert!(self.path.is_empty(), "only the root may be empty");
+            self.map.root_addr = match node.node_type() {
+                NodeType::Leaf => NULL,
+                NodeType::Internal => node.child(0),
+            };
+            self.map.deallocate_node(node);
             self.header_dirty = true;
+        } else if level.dirty {
+            self.map.save_node(&mut node);
+        } else {
+            self.map.return_node(node, level.depth);
         }
     }
 
-    /// Releases the root, the last node on the path. An empty leaf root leaves the map
-    /// empty; an internal root left with no entries hands the root over to its only child.
-    fn release_root(&mut self, mut root: Node<K>, dirty: bool, depth: u8) {
-        if root.entries_len() > 0 {
-            if dirty {
-                self.map.save_node(&mut root);
-            } else {
-                self.map.return_node(root, depth);
-            }
-            return;
-        }
-        self.map.root_addr = match root.node_type() {
-            NodeType::Leaf => NULL,
-            NodeType::Internal => root.child(0),
-        };
-        self.map.deallocate_node(root);
-        self.header_dirty = true;
-    }
-
-    /// Puts right every internal node on the path left under the minimum by a rebalance
-    /// beneath it, bottom-up, and drops a root left with no entries if its only child is
-    /// still held. A root with nothing else on the path is left to [`Self::release`].
-    fn fix_path(&mut self) {
-        let mut level = self.path.len() - 1;
+    /// Puts right the node at the bottom of the path if it is under the minimum, keeping it
+    /// on the path, and then every node above it that the fix took under the minimum in
+    /// turn. A root left with no entries is dropped, if its only child is still held.
+    ///
+    /// Each node is filled from the sibling on the `toward` side, if it has one. That is
+    /// the side the batch is heading to, so what the node takes in is what the batch wants
+    /// next, and the node goes on serving it instead of being written and read back.
+    fn fix_path(&mut self, toward: Side) {
+        let mut level = self.path.len().saturating_sub(1);
         while level > 0 && self.path[level].node.entries_len() < MIN_ENTRIES {
             let (above, rest) = self.path.split_at_mut(level);
             let parent = &mut above[level - 1];
@@ -267,6 +380,7 @@ where
                 &mut current.node,
                 current.index_in_parent,
                 &mut parent.node,
+                toward,
             );
             parent.dirty = true;
 
@@ -304,22 +418,26 @@ where
     }
 
     /// Brings `node`, the child at `idx` of the held `parent`, back up to the minimum,
-    /// using its right sibling if it has one and its left one otherwise. If the two hold
-    /// too few entries between them to fill two nodes, the sibling and their separator are
-    /// merged into `node` and the sibling is deallocated; otherwise entries rotate across
-    /// through the parent until `node` is at the minimum and the sibling is written out.
-    /// `node` and `parent` are left for the caller to save.
+    /// using its sibling on the `toward` side if it has one and its other sibling
+    /// otherwise. If the two hold too few entries between them to fill two nodes, the
+    /// sibling and their separator are merged into `node` and the sibling is deallocated;
+    /// otherwise entries rotate across through the parent until `node` is at the minimum
+    /// and the sibling is written out. `node` and `parent` are left for the caller to save.
     fn rebalance(
         map: &mut BTreeMap<K, V, M>,
         node: &mut Node<K>,
         idx: usize,
         parent: &mut Node<K>,
+        toward: Side,
     ) -> Moved {
         #[cfg(feature = "bench_scope")]
         let _p = canbench_rs::bench_scope("bulk_remove_rebalance"); // May add significant overhead.
 
         debug_assert!(parent.children_len() >= 2, "a held parent has a sibling");
-        let sibling_is_left = idx + 1 == parent.children_len();
+        let sibling_is_left = match toward {
+            Side::Left => idx > 0,
+            Side::Right => idx + 1 == parent.children_len(),
+        };
         let sibling_idx = if sibling_is_left { idx - 1 } else { idx + 1 };
         let separator_idx = if sibling_is_left { idx - 1 } else { idx };
         let mut sibling = map.take_or_load_node(parent.child(sibling_idx));
@@ -445,6 +563,13 @@ where
     }
 }
 
+/// One side of the path: that of the smaller keys, or that of the larger.
+#[derive(Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+}
+
 /// What a rebalance did to the position of `node`'s children.
 struct Moved {
     /// The left sibling was merged in, so `node` now sits one place further left in its
@@ -461,6 +586,7 @@ where
     M: Memory,
 {
     fn drop(&mut self) {
+        self.fix_path(Side::Right);
         while let Some(level) = self.path.pop() {
             self.release(level);
         }
