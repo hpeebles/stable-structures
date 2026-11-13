@@ -1699,7 +1699,7 @@ pub fn btreemap_v2_remove_many_desc_u64_u64() -> BenchResult {
     })
 }
 
-// `remove_many` wants ascending keys, so a caller holding unordered keys sorts them first.
+// `remove_many` wants sorted keys, so a caller holding unordered keys sorts them first.
 // The sort is inside the measured section; the loop baseline is `btreemap_v2_remove_u64_u64`.
 #[bench(raw)]
 pub fn btreemap_v2_remove_many_sorted_random_u64_u64() -> BenchResult {
@@ -1751,8 +1751,10 @@ pub fn btreemap_v2_remove_many_run_u64_u64() -> BenchResult {
     })
 }
 
-// Every tenth key of a 100k map: each leaf loses an entry or two, so most of them stay above
-// the minimum and only need writing once.
+// Every tenth key of a 100k map. `sequential_map` builds in key order, which leaves every
+// leaf at the minimum, so each leaf that loses a key underflows and has to be merged with a
+// neighbour. This is the costly end of spread-out removal: in a map with fuller leaves most
+// of them would stay above the minimum and only need writing once.
 #[bench(raw)]
 pub fn btreemap_v2_remove_loop_spread_u64_u64() -> BenchResult {
     let mut btree = sequential_map(100_000);
