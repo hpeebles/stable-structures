@@ -4075,3 +4075,206 @@ fn remove_many_preserves_the_btree_invariants() {
         );
     }
 }
+
+/// One randomized run of `remove_many` against a model, for one key and value type.
+///
+/// Every batch is followed by a walk of the tree as it is stored, a comparison of its
+/// contents with the model, and a second comparison through a map freshly loaded from the
+/// same memory, so that nothing can hide in the node cache or an unwritten header. The
+/// held path is checked after every key by `remove_many` itself when built for tests.
+fn remove_many_stress<K, V>(
+    seed: u64,
+    key: impl Fn(u64) -> K,
+    value: impl Fn(u64) -> V,
+    new_map: impl Fn(Rc<RefCell<Vec<u8>>>) -> BTreeMap<K, V, Rc<RefCell<Vec<u8>>>>,
+) where
+    K: Storable + Ord + Clone + std::fmt::Debug,
+    V: Storable + Clone + PartialEq + std::fmt::Debug,
+{
+    let mut next = xorshift(seed);
+    let universe = [12u64, 40, 90, 200, 700, 2_500][(next() % 6) as usize];
+    let memory = make_memory();
+    let mut map = new_map(memory.clone());
+    let mut model: StdBTreeMap<u64, u64> = StdBTreeMap::new();
+
+    let check = |map: &BTreeMap<K, V, _>, model: &StdBTreeMap<u64, u64>, ctx: &str| {
+        assert_btree_invariants(map, ctx);
+        let expected: Vec<(K, V)> = model.iter().map(|(k, v)| (key(*k), value(*v))).collect();
+        assert_eq!(map.len() as usize, expected.len(), "{ctx}: length");
+        assert_eq!(collect_entry(map.iter()), expected, "{ctx}: contents");
+        let reloaded: BTreeMap<K, V, _> = BTreeMap::load(memory.clone());
+        assert_eq!(
+            reloaded.len() as usize,
+            expected.len(),
+            "{ctx}: stored length"
+        );
+        assert_eq!(
+            collect_entry(reloaded.iter()),
+            expected,
+            "{ctx}: stored contents"
+        );
+    };
+
+    // Fill in a random order, so that nodes end up anywhere between half full and full.
+    let mut ids: Vec<u64> = (0..universe).filter(|_| next() % 8 != 0).collect();
+    for i in (1..ids.len()).rev() {
+        ids.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    for id in &ids {
+        let v = next();
+        map.insert(key(*id), value(v));
+        model.insert(*id, v);
+    }
+    check(&map, &model, &format!("seed {seed}: after the fill"));
+
+    for step in 0..20 {
+        let shape = next() % 12;
+        let ctx = format!("seed {seed} step {step} shape {shape} universe {universe}");
+        let start = next() % universe;
+        let len = 1 + next() % universe;
+        let mut batch: Vec<u64> = match shape {
+            // A run, as it comes or backwards.
+            0 | 1 => (start..(start + len).min(universe + 5)).collect(),
+            // A random subset.
+            2..=4 => (0..len).map(|_| next() % (universe + 5)).collect(),
+            // Every k-th key.
+            5 | 6 => (start % 7..universe)
+                .step_by(1 + (next() % 9) as usize)
+                .collect(),
+            // A few runs, each ascending, in no particular order.
+            7 => (0..1 + next() % 4)
+                .flat_map(|_| {
+                    let from = next() % universe;
+                    from..(from + 1 + next() % 40).min(universe)
+                })
+                .collect(),
+            // Everything.
+            8 => (0..universe).collect(),
+            // Top the map back up, so that later batches have something to remove.
+            9 => {
+                let pairs: Vec<(u64, u64)> =
+                    (0..len).map(|_| (next() % universe, next())).collect();
+                map.insert_many(pairs.iter().map(|(k, v)| (key(*k), value(*v))));
+                model.extend(pairs);
+                check(&map, &model, &ctx);
+                continue;
+            }
+            10 => {
+                for _ in 0..len.min(50) {
+                    let (k, v) = (next() % universe, next());
+                    assert_eq!(
+                        map.insert(key(k), value(v)),
+                        model.insert(k, v).map(&value),
+                        "{ctx}: insert"
+                    );
+                }
+                check(&map, &model, &ctx);
+                continue;
+            }
+            _ => {
+                for _ in 0..len.min(50) {
+                    let k = next() % universe;
+                    assert_eq!(map.remove(&key(k)), model.remove(&k).map(&value), "{ctx}");
+                }
+                check(&map, &model, &ctx);
+                continue;
+            }
+        };
+        match next() % 4 {
+            0 => batch.sort_unstable(),
+            1 => {
+                batch.sort_unstable();
+                batch.reverse();
+            }
+            2 if shape != 4 => batch.reverse(),
+            _ => {}
+        }
+        for id in &batch {
+            model.remove(id);
+        }
+        if next() % 2 == 0 {
+            map.remove_many(batch.iter().map(|id| key(*id)));
+        } else {
+            let keys: Vec<K> = batch.iter().map(|id| key(*id)).collect();
+            map.remove_many(&keys);
+        }
+        check(&map, &model, &ctx);
+    }
+
+    // Whatever is left goes in one batch, and with it every chunk the map allocated.
+    let mut rest: Vec<u64> = model.keys().copied().collect();
+    if next() % 2 == 0 {
+        rest.reverse();
+    }
+    map.remove_many(rest.iter().map(|id| key(*id)));
+    assert!(map.is_empty(), "seed {seed}");
+    assert_eq!(
+        map.root_addr, NULL,
+        "seed {seed}: the root is still allocated"
+    );
+    assert_eq!(
+        map.allocator.num_allocated_chunks(),
+        0,
+        "seed {seed}: chunks left allocated"
+    );
+}
+
+/// How many seeds the stress tests run. `REMOVE_MANY_STRESS_SEEDS` raises it for a soak.
+fn remove_many_stress_seeds() -> u64 {
+    std::env::var("REMOVE_MANY_STRESS_SEEDS")
+        .ok()
+        .and_then(|seeds| seeds.parse().ok())
+        .unwrap_or(40)
+}
+
+#[test]
+fn remove_many_stress_small_keys() {
+    for seed in 0..remove_many_stress_seeds() {
+        let cache_slots = [0usize, 1, 16][(seed % 3) as usize];
+        remove_many_stress::<u64, u64>(
+            seed,
+            |id| id,
+            |v| v,
+            |memory| BTreeMap::new(memory).with_node_cache(cache_slots),
+        );
+    }
+}
+
+#[test]
+fn remove_many_stress_lazily_loaded_keys() {
+    // Keys over the eager-load threshold stay on their node's page until asked for, and
+    // values of up to a few pages spill onto overflow pages, so every entry a rebalance
+    // moves has to be read off the page it is leaving first.
+    for seed in 0..remove_many_stress_seeds() {
+        let cache_slots = [0usize, 1, 16][(seed % 3) as usize];
+        remove_many_stress::<String, Vec<u8>>(
+            seed,
+            |id| format!("{id:0>40}"),
+            |v| vec![v as u8; (v % 1_500) as usize],
+            |memory| BTreeMap::new(memory).with_node_cache(cache_slots),
+        );
+    }
+}
+
+#[test]
+fn remove_many_stress_v1_layouts() {
+    // The V1 layout reads every key and value lazily, and a map migrated from it holds
+    // nodes of both layouts side by side.
+    for seed in 0..remove_many_stress_seeds() {
+        remove_many_stress::<Blob<24>, Blob<40>>(
+            seed,
+            |id| Blob::try_from(&id.to_be_bytes()[..]).unwrap(),
+            |v| Blob::try_from(&v.to_le_bytes()[..(v % 9) as usize]).unwrap(),
+            BTreeMap::new_v1,
+        );
+        remove_many_stress::<Blob<24>, Blob<40>>(
+            seed,
+            |id| Blob::try_from(&id.to_be_bytes()[..]).unwrap(),
+            |v| Blob::try_from(&v.to_le_bytes()[..(v % 9) as usize]).unwrap(),
+            |memory| {
+                let v1: BTreeMap<Blob<24>, Blob<40>, _> = BTreeMap::new_v1(memory);
+                BTreeMap::load_helper(v1.into_memory(), true)
+            },
+        );
+    }
+}

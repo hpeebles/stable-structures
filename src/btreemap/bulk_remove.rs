@@ -367,6 +367,84 @@ where
     }
 }
 
+#[cfg(test)]
+impl<K, V, M> BulkRemove<'_, K, V, M>
+where
+    K: Storable + Ord + Clone,
+    V: Storable,
+    M: Memory,
+{
+    /// Checks everything the batch relies on between two keys: the path runs from the
+    /// root down through each level's recorded child slot, every level's bounds are the
+    /// separators either side of that slot, and nothing but a leaf at the bottom is below
+    /// the minimum. Called after every key under test, so that a slip in the bookkeeping
+    /// is caught where it happens rather than as a damaged tree several keys later.
+    pub(super) fn assert_path_invariants(&self) {
+        use crate::btreemap::node::CAPACITY;
+
+        let memory = self.map.memory();
+        for (i, level) in self.path.iter().enumerate() {
+            let node = &level.node;
+            let len = node.entries_len();
+            assert_eq!(level.depth as usize, i, "depth of level {i}");
+
+            if i == 0 {
+                assert_eq!(
+                    node.address(),
+                    self.map.root_addr,
+                    "the path starts at the root"
+                );
+                assert!(level.lower.is_none() && level.upper.is_none());
+                assert_eq!(level.index_in_parent, 0);
+            } else {
+                let parent = &self.path[i - 1];
+                assert_eq!(
+                    parent.node.child(level.index_in_parent),
+                    node.address(),
+                    "level {i} is not at its recorded slot in its parent"
+                );
+                let (lower, upper) = parent.child_bounds(level.index_in_parent, memory);
+                assert!(
+                    lower == level.lower && upper == level.upper,
+                    "the bounds of level {i} are not the separators around it"
+                );
+            }
+
+            assert!(len <= CAPACITY, "level {i} is over capacity");
+            match node.node_type() {
+                NodeType::Internal => {
+                    assert_eq!(node.children_len(), len + 1, "children of level {i}");
+                    let minimum = if i == 0 { 1 } else { MIN_ENTRIES };
+                    assert!(
+                        len >= minimum,
+                        "internal level {i} holds only {len} entries"
+                    );
+                }
+                NodeType::Leaf => {
+                    assert_eq!(
+                        i + 1,
+                        self.path.len(),
+                        "a leaf above the bottom of the path"
+                    );
+                    assert_eq!(node.children_len(), 0);
+                }
+            }
+
+            for j in 0..len {
+                let key = node.key(j, memory);
+                assert!(
+                    level.covers(key),
+                    "a key of level {i} is outside its bounds"
+                );
+                assert!(
+                    j == 0 || node.key(j - 1, memory) < key,
+                    "keys of level {i} unsorted"
+                );
+            }
+        }
+    }
+}
+
 /// What a rebalance did to the position of `node`'s children.
 struct Moved {
     /// The left sibling was merged in, so `node` now sits one place further left in its

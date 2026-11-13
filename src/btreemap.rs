@@ -1407,6 +1407,8 @@ where
         let mut bulk = BulkRemove::new(self);
         for key in keys {
             bulk.remove(key.borrow());
+            #[cfg(test)]
+            bulk.assert_path_invariants();
         }
         // Dropping `bulk` here puts right and writes out the path it is still holding,
         // along with the header. That is what completes the batch.
